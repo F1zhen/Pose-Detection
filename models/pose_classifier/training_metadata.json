@@ -1,0 +1,103 @@
+{
+  "dataset_root": "datasets\\pose_classifier\\labeled",
+  "output_dir": "models\\pose_classifier",
+  "model_name": "efficientnet_b0",
+  "epochs": 12,
+  "batch_size": 32,
+  "image_size": 224,
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "train_samples": 1084,
+  "val_samples": 272,
+  "best_val_accuracy": 0.9853,
+  "class_names": [
+    "sit",
+    "stand"
+  ],
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.4676,
+      "train_accuracy": 0.8229,
+      "val_loss": 0.2432,
+      "val_accuracy": 0.9375
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.1813,
+      "train_accuracy": 0.9465,
+      "val_loss": 0.1308,
+      "val_accuracy": 0.9706
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.1149,
+      "train_accuracy": 0.9659,
+      "val_loss": 0.1217,
+      "val_accuracy": 0.9706
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.0689,
+      "train_accuracy": 0.9779,
+      "val_loss": 0.1227,
+      "val_accuracy": 0.9669
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.0541,
+      "train_accuracy": 0.9843,
+      "val_loss": 0.121,
+      "val_accuracy": 0.9743
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.0359,
+      "train_accuracy": 0.988,
+      "val_loss": 0.1093,
+      "val_accuracy": 0.9853
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.0342,
+      "train_accuracy": 0.988,
+      "val_loss": 0.1194,
+      "val_accuracy": 0.9779
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.0302,
+      "train_accuracy": 0.9917,
+      "val_loss": 0.1124,
+      "val_accuracy": 0.9816
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.0262,
+      "train_accuracy": 0.9889,
+      "val_loss": 0.1271,
+      "val_accuracy": 0.9779
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.0263,
+      "train_accuracy": 0.9908,
+      "val_loss": 0.1376,
+      "val_accuracy": 0.9779
+    },
+    {
+      "epoch": 11,
+      "train_loss": 0.0185,
+      "train_accuracy": 0.9935,
+      "val_loss": 0.1443,
+      "val_accuracy": 0.9779
+    },
+    {
+      "epoch": 12,
+      "train_loss": 0.0096,
+      "train_accuracy": 0.9982,
+      "val_loss": 0.1497,
+      "val_accuracy": 0.9779
+    }
+  ]
+}
