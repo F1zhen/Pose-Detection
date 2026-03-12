@@ -12,14 +12,9 @@ import pandas as pd
 SUPPORTED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 DEFAULT_MODEL = "yolov8s-pose.pt"
 PERSON_CLASS_ID = 0
-KEYPOINT_CONF_THRESHOLD = 0.4
 
-STAND_HEIGHT_RATIO = 1.15
-SHOULDER_Y_THRESHOLD = 0.40
 MOVEMENT_THRESHOLD = 80
 FRAME_SKIP = 10
-LOCAL_DEPTH_WINDOW = 0.12
-SHOULDER_OFFSET_THRESHOLD = 0.02
 POSE_SMOOTHING_WINDOW = 3
 POSE_SCORE_THRESHOLD = 0.15
 MIN_STATE_FRAMES = 3
@@ -34,15 +29,6 @@ HORSEPLAY_BURST_WINDOW_SEC = 4.0
 HORSEPLAY_BURST_MIN = 3
 HORSEPLAY_SCORE_THRESHOLD = 2.0
 HORSEPLAY_STANDING_WEIGHT = 0.5
-
-LEFT_SHOULDER_IDX = 5
-RIGHT_SHOULDER_IDX = 6
-LEFT_KNEE_IDX = 13
-RIGHT_KNEE_IDX = 14
-LEFT_HIP_IDX = 11
-RIGHT_HIP_IDX = 12
-LEFT_ANKLE_IDX = 15
-RIGHT_ANKLE_IDX = 16
 
 POSE_SIT = "sit"
 POSE_STAND = "stand"
@@ -61,18 +47,11 @@ class DetectionState:
     person_id: int
     bbox: Tuple[int, int, int, int]
     pose: str
-    raw_pose: str
     classifier_pose: Optional[str]
     classifier_confidence: Optional[float]
     violation_type: str
     movement_px: Optional[float]
     rapid_motion: bool
-    relative_height_ratio: Optional[float]
-    shoulder_y_normalized: Optional[float]
-    shoulder_offset: Optional[float]
-    local_height_median: Optional[float]
-    local_shoulder_median: Optional[float]
-    knee_angle: Optional[float]
     center: Tuple[float, float]
     frame_index: int
     timestamp_sec: float
@@ -113,12 +92,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--model", default=DEFAULT_MODEL, help="YOLO pose model path.")
     parser.add_argument("--pose-classifier", type=Path, default=None, help="Path to trained sit/stand classifier checkpoint.")
-    parser.add_argument(
-        "--classifier-mode",
-        choices=["hybrid", "classifier_only"],
-        default="hybrid",
-        help="How to use the trained classifier if provided.",
-    )
     parser.add_argument("--classifier-threshold", type=float, default=0.65)
     parser.add_argument("--classifier-padding", type=float, default=0.12)
     parser.add_argument(
@@ -137,10 +110,6 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Stop after this many frames. 0 means process the whole video.",
     )
-    parser.add_argument("--stand-height-ratio", type=float, default=STAND_HEIGHT_RATIO)
-    parser.add_argument("--shoulder-y-threshold", type=float, default=SHOULDER_Y_THRESHOLD)
-    parser.add_argument("--local-depth-window", type=float, default=LOCAL_DEPTH_WINDOW)
-    parser.add_argument("--shoulder-offset-threshold", type=float, default=SHOULDER_OFFSET_THRESHOLD)
     parser.add_argument("--pose-smoothing-window", type=int, default=POSE_SMOOTHING_WINDOW)
     parser.add_argument("--pose-score-threshold", type=float, default=POSE_SCORE_THRESHOLD)
     parser.add_argument("--min-state-frames", type=int, default=MIN_STATE_FRAMES)
@@ -263,10 +232,6 @@ def get_bbox_tuple(bbox_xyxy: np.ndarray) -> Tuple[int, int, int, int]:
     return (int(x1), int(y1), int(x2), int(y2))
 
 
-def get_bbox_height(bbox_xyxy: np.ndarray) -> float:
-    return float(max(1.0, bbox_xyxy[3] - bbox_xyxy[1]))
-
-
 def expand_bbox(
     bbox_xyxy: np.ndarray,
     frame_width: int,
@@ -286,117 +251,15 @@ def expand_bbox(
     )
 
 
-def get_bbox_bottom_normalized(bbox_xyxy: np.ndarray, frame_height: int) -> float:
-    if frame_height <= 0:
-        return 0.0
-    return float(bbox_xyxy[3] / frame_height)
-
-
-def compute_shoulder_y_normalized(
-    keypoints_xy: np.ndarray,
-    keypoints_conf: np.ndarray,
-    frame_height: int,
-) -> Optional[float]:
-    valid_y: List[float] = []
-    for idx in (LEFT_SHOULDER_IDX, RIGHT_SHOULDER_IDX):
-        if idx < len(keypoints_conf) and keypoints_conf[idx] > KEYPOINT_CONF_THRESHOLD:
-            valid_y.append(float(keypoints_xy[idx][1]))
-    if not valid_y or frame_height <= 0:
-        return None
-    return float(np.mean(valid_y) / frame_height)
-
-
-def angle_between_points(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> Optional[float]:
-    ba = a - b
-    bc = c - b
-    if np.linalg.norm(ba) == 0 or np.linalg.norm(bc) == 0:
-        return None
-    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-    cosine = float(np.clip(cosine, -1.0, 1.0))
-    return float(np.degrees(np.arccos(cosine)))
-
-
-def compute_knee_angle(keypoints_xy: np.ndarray, keypoints_conf: np.ndarray) -> Optional[float]:
-    candidates = [
-        (LEFT_HIP_IDX, LEFT_KNEE_IDX, LEFT_ANKLE_IDX),
-        (RIGHT_HIP_IDX, RIGHT_KNEE_IDX, RIGHT_ANKLE_IDX),
-    ]
-    angles: List[float] = []
-    for hip_idx, knee_idx, ankle_idx in candidates:
-        if max(hip_idx, knee_idx, ankle_idx) >= len(keypoints_conf):
-            continue
-        if (
-            keypoints_conf[hip_idx] > KEYPOINT_CONF_THRESHOLD
-            and keypoints_conf[knee_idx] > KEYPOINT_CONF_THRESHOLD
-            and keypoints_conf[ankle_idx] > KEYPOINT_CONF_THRESHOLD
-        ):
-            angle = angle_between_points(
-                keypoints_xy[hip_idx],
-                keypoints_xy[knee_idx],
-                keypoints_xy[ankle_idx],
-            )
-            if angle is not None:
-                angles.append(angle)
-    if not angles:
-        return None
-    return float(np.mean(angles))
-
-
-def classify_pose(
-    relative_height_ratio: Optional[float],
-    shoulder_y_normalized: Optional[float],
-    shoulder_offset: Optional[float],
-    stand_height_ratio: float,
-    shoulder_y_threshold: float,
-    shoulder_offset_threshold: float,
-) -> str:
-    by_height: Optional[str] = None
-    by_shoulder: Optional[str] = None
-    by_offset: Optional[str] = None
-
-    if relative_height_ratio is not None:
-        by_height = POSE_STAND if relative_height_ratio >= stand_height_ratio else POSE_SIT
-
-    if shoulder_y_normalized is not None:
-        by_shoulder = (
-            POSE_STAND if shoulder_y_normalized <= shoulder_y_threshold else POSE_SIT
-        )
-
-    if shoulder_offset is not None:
-        by_offset = (
-            POSE_STAND if shoulder_offset >= shoulder_offset_threshold else POSE_SIT
-        )
-
-    decisions = [decision for decision in (by_height, by_shoulder, by_offset) if decision]
-    if not decisions:
-        return POSE_UNKNOWN
-    if decisions.count(POSE_STAND) > decisions.count(POSE_SIT):
-        return POSE_STAND
-    if decisions.count(POSE_SIT) > decisions.count(POSE_STAND):
-        return POSE_SIT
-    return POSE_UNKNOWN
-
-
-def compute_local_reference(values: np.ndarray, positions: np.ndarray, index: int, window: float) -> Optional[float]:
-    if len(values) == 0 or index >= len(values):
-        return None
-    position = positions[index]
-    mask = np.abs(positions - position) <= window
-    local_values = values[mask]
-    if len(local_values) == 0:
-        return None
-    return float(np.median(local_values))
-
-
 def smooth_pose(
     person_id: int,
-    raw_pose: str,
+    pose_value: str,
     pose_history: Dict[int, List[str]],
     window_size: int,
     score_threshold: float,
 ) -> str:
     history = pose_history.setdefault(person_id, [])
-    history.append(raw_pose)
+    history.append(pose_value)
     if len(history) > max(window_size, 1):
         del history[:-window_size]
 
@@ -584,7 +447,7 @@ def update_live_report_stats(
         live_stats.analyzed_frames += 1
         for row in frame_rows:
             person_id = row.get("person_id")
-            if person_id is not None:
+            if person_id is not None: #УНИКАЛЬНЫЕ ID лЮДЕЙ ЗА ВСЕ ВРЕМЯ, ВОЗМОЖНО НАДО ДОБАВИТЬ ТАЙМЕР ДОБАВЛЕНИЙ И УДАЛЕНИЙ ИЗ НАБОРА, ЧТОБЫ НЕ СЧИТАТЬ ЧЕЛОВЕКА, КОТОРЫЙ ПОЯВИЛСЯ, ПРОПАЛ И ПОЯВИЛСЯ СНОВА, КАК ДВОИХ РАЗНЫХ ЧЕЛОВЕКОВ
                 live_stats.unique_people.add(int(person_id))
 
             if count_only:
@@ -602,7 +465,7 @@ def update_live_report_stats(
                 live_stats.rapid_motion_frames += 1
             if bool(row.get("horseplay", False)):
                 live_stats.horseplay_frames += 1
-
+# текущее число людей на экране.
     live_stats.current_people = len(states)
     if count_only:
         return
@@ -631,9 +494,6 @@ def draw_live_report_panel(
         lines.extend(
             [
                 f"now sit={live_stats.current_sit} stand={live_stats.current_stand} unk={live_stats.current_unknown}",
-                f"sum sit={live_stats.sit_frames} stand={live_stats.stand_frames} unk={live_stats.unknown_frames}",
-                f"rapid now={live_stats.current_rapid_motion} sum={live_stats.rapid_motion_frames}",
-                f"horse now={live_stats.current_horseplay} sum={live_stats.horseplay_frames}",
             ]
         )
 
@@ -741,7 +601,7 @@ def annotate_frame(
         draw_live_report_panel(annotated, live_stats=live_stats, mode=mode, count_only=count_only)
     return annotated
 
-
+# ЗДЕСЬ РЕАЛИЗОВАНА ПОДСЧЕТ ЛЮДЕЙ И СОСТОЯНИЙ БЕЗ АНАЛИЗА ПОЗЫ И КЛАССИФИКАТОРА, ДЛЯ БЫСТРОГО РЕЖИМА count-only
 def count_only_states(result, frame_index: int, timestamp_sec: float) -> Tuple[Dict[int, DetectionState], List[Dict[str, object]]]:
     states: Dict[int, DetectionState] = {}
     rows: List[Dict[str, object]] = []
@@ -760,18 +620,11 @@ def count_only_states(result, frame_index: int, timestamp_sec: float) -> Tuple[D
             person_id=person_id,
             bbox=get_bbox_tuple(bbox),
             pose=POSE_UNKNOWN,
-            raw_pose=POSE_UNKNOWN,
             classifier_pose=None,
             classifier_confidence=None,
             violation_type="",
             movement_px=None,
             rapid_motion=False,
-            relative_height_ratio=None,
-            shoulder_y_normalized=None,
-            shoulder_offset=None,
-            local_height_median=None,
-            local_shoulder_median=None,
-            knee_angle=None,
             center=compute_person_center(bbox),
             frame_index=frame_index,
             timestamp_sec=timestamp_sec,
@@ -796,7 +649,6 @@ def results_to_states(
     frame: np.ndarray,
     frame_index: int,
     timestamp_sec: float,
-    frame_height: int,
     args: argparse.Namespace,
     pose_history: Dict[int, List[str]],
     previous_centers: Dict[int, Tuple[float, float]],
@@ -806,7 +658,6 @@ def results_to_states(
     states: Dict[int, DetectionState] = {}
     report_rows: List[Dict[str, object]] = []
     _person_data: Dict[int, Dict] = {}
-    classifier_only_mode = classifier_bundle is not None and args.classifier_mode == "classifier_only"
 
     if result.boxes is None or result.boxes.id is None or len(result.boxes) == 0:
         return states, report_rows
@@ -814,75 +665,9 @@ def results_to_states(
     boxes_xyxy = result.boxes.xyxy.cpu().numpy()
     track_ids = result.boxes.id.int().cpu().tolist()
     box_confidences = result.boxes.conf.cpu().numpy()
-    heights = np.array([get_bbox_height(box) for box in boxes_xyxy], dtype=float)
-    bottom_positions = np.array(
-        [get_bbox_bottom_normalized(box, frame_height) for box in boxes_xyxy],
-        dtype=float,
-    )
-
-    keypoints_xy = None
-    keypoints_conf = None
-    if not classifier_only_mode and result.keypoints is not None:
-        keypoints_xy = result.keypoints.xy.cpu().numpy()
-        keypoints_conf = result.keypoints.conf.cpu().numpy()
-
-    shoulder_positions = np.array([np.nan] * len(track_ids), dtype=float)
-    if not classifier_only_mode and keypoints_xy is not None and keypoints_conf is not None:
-        for idx in range(min(len(track_ids), len(keypoints_xy))):
-            shoulder_positions[idx] = (
-                compute_shoulder_y_normalized(keypoints_xy[idx], keypoints_conf[idx], frame_height)
-                if idx < len(keypoints_xy)
-                else np.nan
-            )
 
     for idx, person_id in enumerate(track_ids):
         bbox = boxes_xyxy[idx]
-        bbox_height = get_bbox_height(bbox)
-        local_height_median = None
-        relative_height_ratio = None
-        if not classifier_only_mode:
-            local_height_median = compute_local_reference(
-                values=heights,
-                positions=bottom_positions,
-                index=idx,
-                window=args.local_depth_window,
-            )
-            relative_height_ratio = (
-                float(bbox_height / local_height_median)
-                if local_height_median and local_height_median > 0
-                else None
-            )
-
-        shoulder_y_normalized = None
-        local_shoulder_median = None
-        shoulder_offset = None
-        knee_angle = None
-        if not classifier_only_mode and keypoints_xy is not None and keypoints_conf is not None and idx < len(keypoints_xy):
-            shoulder_y_normalized = safe_float(shoulder_positions[idx])
-            valid_shoulder_mask = ~np.isnan(shoulder_positions)
-            if shoulder_y_normalized is not None and np.any(valid_shoulder_mask):
-                local_shoulder_median = compute_local_reference(
-                    values=shoulder_positions[valid_shoulder_mask],
-                    positions=bottom_positions[valid_shoulder_mask],
-                    index=int(np.sum(valid_shoulder_mask[: idx + 1]) - 1),
-                    window=args.local_depth_window,
-                )
-                if local_shoulder_median is not None:
-                    shoulder_offset = float(local_shoulder_median - shoulder_y_normalized)
-            knee_angle = compute_knee_angle(keypoints_xy[idx], keypoints_conf[idx])
-
-        heuristic_pose = (
-            classify_pose(
-                relative_height_ratio=relative_height_ratio,
-                shoulder_y_normalized=shoulder_y_normalized,
-                shoulder_offset=shoulder_offset,
-                stand_height_ratio=args.stand_height_ratio,
-                shoulder_y_threshold=args.shoulder_y_threshold,
-                shoulder_offset_threshold=args.shoulder_offset_threshold,
-            )
-            if not classifier_only_mode
-            else POSE_UNKNOWN
-        )
         classifier_pose, classifier_confidence = classify_crop_with_model(
             frame=frame,
             bbox_xyxy=bbox,
@@ -890,15 +675,10 @@ def results_to_states(
             threshold=args.classifier_threshold,
             padding_ratio=args.classifier_padding,
         )
-        raw_pose = heuristic_pose
-        if classifier_bundle is not None:
-            if args.classifier_mode == "classifier_only":
-                raw_pose = classifier_pose or POSE_UNKNOWN
-            elif classifier_pose in (POSE_SIT, POSE_STAND):
-                raw_pose = classifier_pose
+        pose_value = classifier_pose or POSE_UNKNOWN
         pose = smooth_pose(
             person_id=person_id,
-            raw_pose=raw_pose,
+            pose_value=pose_value,
             pose_history=pose_history,
             window_size=args.pose_smoothing_window,
             score_threshold=args.pose_score_threshold,
@@ -924,19 +704,11 @@ def results_to_states(
             "idx": idx,
             "bbox": bbox,
             "pose": pose,
-            "raw_pose": raw_pose,
-            "heuristic_pose": heuristic_pose,
             "classifier_pose": classifier_pose,
             "classifier_confidence": classifier_confidence,
             "violation_type": violation_type,
             "movement_px": movement_px,
             "rapid_motion": rapid_motion,
-            "relative_height_ratio": relative_height_ratio,
-            "shoulder_y_normalized": shoulder_y_normalized,
-            "shoulder_offset": shoulder_offset,
-            "local_height_median": local_height_median,
-            "local_shoulder_median": local_shoulder_median,
-            "knee_angle": knee_angle,
             "center": center,
             "dx": center[0] - previous_center[0] if previous_center is not None else 0.0,
             "dy": center[1] - previous_center[1] if previous_center is not None else 0.0,
@@ -1026,18 +798,11 @@ def results_to_states(
             person_id=person_id,
             bbox=get_bbox_tuple(d["bbox"]),
             pose=d["pose"],
-            raw_pose=d["raw_pose"],
             classifier_pose=d["classifier_pose"],
             classifier_confidence=safe_float(d["classifier_confidence"]),
             violation_type=violation_type,
             movement_px=safe_float(d["movement_px"]),
             rapid_motion=d["rapid_motion"],
-            relative_height_ratio=safe_float(d["relative_height_ratio"]),
-            shoulder_y_normalized=safe_float(d["shoulder_y_normalized"]),
-            shoulder_offset=safe_float(d["shoulder_offset"]),
-            local_height_median=safe_float(d["local_height_median"]),
-            local_shoulder_median=safe_float(d["local_shoulder_median"]),
-            knee_angle=safe_float(d["knee_angle"]),
             center=d["center"],
             frame_index=frame_index,
             timestamp_sec=timestamp_sec,
@@ -1057,22 +822,14 @@ def results_to_states(
                 "track_confidence": safe_float(float(box_confidences[d["idx"]])),
                 "violation_type": violation_type,
                 "pose": d["pose"],
-                "raw_pose": d["raw_pose"],
                 "classifier_pose": d["classifier_pose"],
                 "classifier_confidence": safe_float(d["classifier_confidence"]),
-                "heuristic_pose": d["heuristic_pose"],
                 "movement_px": safe_float(d["movement_px"]),
                 "rapid_motion": d["rapid_motion"],
                 "bbox_x1": state.bbox[0],
                 "bbox_y1": state.bbox[1],
                 "bbox_x2": state.bbox[2],
                 "bbox_y2": state.bbox[3],
-                "relative_height_ratio": safe_float(d["relative_height_ratio"]),
-                "shoulder_y_normalized": safe_float(d["shoulder_y_normalized"]),
-                "shoulder_offset": safe_float(d["shoulder_offset"]),
-                "local_height_median": safe_float(d["local_height_median"]),
-                "local_shoulder_median": safe_float(d["local_shoulder_median"]),
-                "knee_angle": safe_float(d["knee_angle"]),
                 "horseplay_score": safe_float(horseplay_score) if hp_enabled else None,
                 "horseplay": horseplay_flag,
                 "proximity_ids": proximity_ids_str,
@@ -1446,6 +1203,8 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     torch_device = torch.device(device)
 
     model = YOLO(args.model)
+    if not args.count_only and args.pose_classifier is None:
+        raise ValueError("`--pose-classifier` is required when not using `--count-only`.")
     classifier_bundle = None if args.count_only else load_pose_classifier(args.pose_classifier, torch_device, torch)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1503,7 +1262,6 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                         frame=frame,
                         frame_index=frame_index,
                         timestamp_sec=timestamp_sec,
-                        frame_height=frame_height,
                         args=args,
                         pose_history=pose_history,
                         previous_centers=previous_centers,
@@ -1591,22 +1349,14 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                 "track_confidence",
                 "violation_type",
                 "pose",
-                "raw_pose",
                 "classifier_pose",
                 "classifier_confidence",
-                "heuristic_pose",
                 "movement_px",
                 "rapid_motion",
                 "bbox_x1",
                 "bbox_y1",
                 "bbox_x2",
                 "bbox_y2",
-                "relative_height_ratio",
-                "shoulder_y_normalized",
-                "shoulder_offset",
-                "local_height_median",
-                "local_shoulder_median",
-                "knee_angle",
                 "horseplay_score",
                 "horseplay",
                 "proximity_ids",
