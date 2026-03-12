@@ -241,12 +241,61 @@ Q → quit
 
 Рекомендуется использовать данные с той же камеры, где будет происходить анализ.
 
+<<<<<<< HEAD
 3️⃣ Обучение модели
 python train_pose_classifier.py \
     --dataset-root datasets\pose_classifier\labeled \
     --model-name efficientnet_b0 \
     --epochs 12 \
     --batch-size 32
+=======
+```text
+datasets/pose_classifier/labeled/
+  sit/
+  stand/
+```
+
+И вручную перенесите туда кропы из `unlabeled/crops/`.
+
+Практический минимум:
+
+- `150-300` кропов `sit`
+- `150-300` кропов `stand`
+
+Лучше брать именно из вашей камеры и ваших уроков.
+
+### 2.1. Разметка баловства (Behavior Labeling)
+
+Тот же скрипт поддерживает режим разметки баловства (`normal`, `distracted`, `active`). Для этого укажите аргумент `--task behavior`. Скрипт будет использовать другую целевую папку и другие горячие клавиши:
+
+```bash
+.venv\Scripts\python.exe label_pose_crops.py --task behavior
+```
+
+Горячие клавиши для режима `behavior`:
+- `N` — `normal` (ученик сидит ровно, пишет, слушает)
+- `D` — `distracted` (отвернулся, лежит на парте)
+- `A` — `active` (балуется, дерётся, стоит без причины)
+- `U` — `skip` (пропустить)
+- `Backspace` — отменить последнюю разметку
+
+Скрипт будет работать с папками:
+- Исходники: `datasets/behavior_classifier/unlabeled`
+- Разметка: `datasets/behavior_classifier/labeled/{normal, distracted, active}`
+- Прогресс: `datasets/behavior_classifier/label_progress.csv`
+
+### 3. Обучить классификатор
+
+```bash
+.venv\Scripts\python.exe train_pose_classifier.py --dataset-root datasets\pose_classifier\labeled --model-name efficientnet_b0 --epochs 12 --batch-size 32 --device cpu
+```
+
+Если GPU настроен:
+
+```bash
+.venv\Scripts\python.exe train_pose_classifier.py --dataset-root datasets\pose_classifier\labeled --model-name efficientnet_b0 --epochs 12 --batch-size 32 --device cuda:0
+```
+>>>>>>> balovanie
 
 Результат:
 
@@ -276,5 +325,97 @@ models/pose_classifier/training_metadata.json
 
 Zhenis Esimbekov
 
+<<<<<<< HEAD
 Software Engineering Student
 AI / Computer Vision Projects
+=======
+- `classifier_only` — поза берётся только из обученной модели;
+- `hybrid` — если классификатор уверен, используется он, иначе остаются эвристики.
+
+## Что пишет режим `calibrate`
+
+На каждом анализируемом человеке отображаются:
+
+- `ID`
+- итоговая поза
+- `h_ratio`
+- `shoulder_y`
+- `knee_angle` — только как диагностическая метрика, если колено и голеностоп видны
+
+Это позволяет руками подобрать рабочие значения порогов именно под вашу камеру и класс.
+
+## Формат отчёта
+
+### 1. Raw detections
+
+`*_raw_detections.csv/xlsx` содержит сырые наблюдения по анализируемым кадрам:
+
+- `timestamp`
+- `timestamp_sec`
+- `frame`
+- `person_id`
+- `track_confidence`
+- `pose`
+- `raw_pose`
+- `bbox_x1`, `bbox_y1`, `bbox_x2`, `bbox_y2`
+- `relative_height_ratio`
+- `shoulder_y_normalized`
+- `shoulder_offset`
+- `local_height_median`
+- `local_shoulder_median`
+- `knee_angle`
+
+### 2. State report
+
+`*_report.csv/xlsx` содержит те же поля плюс итоговое сглаженное состояние:
+
+- `timestamp`
+- `timestamp_sec`
+- `frame`
+- `person_id`
+- `track_confidence`
+- `violation_type`
+- `pose`
+- `raw_pose`
+- `stable_pose`
+- `bbox_x1`, `bbox_y1`, `bbox_x2`, `bbox_y2`
+- `relative_height_ratio`
+- `shoulder_y_normalized`
+- `shoulder_offset`
+- `local_height_median`
+- `local_shoulder_median`
+- `knee_angle`
+
+### 3. Events
+
+`*_events.csv/xlsx/json` содержит уже склеенные интервалы:
+
+- `person_id`
+- `event_type`
+- `start_timestamp`
+- `end_timestamp`
+- `start_frame`
+- `end_frame`
+- `duration_sec`
+- `num_observations`
+
+На шаге 1 поле `violation_type` в основном пустое, кроме случаев длительного стояния в режиме `analyze`.
+
+## Цвета аннотации
+
+- зелёный — `sit`
+- оранжевый — `stand`
+- серый — `unknown`
+- красный — нарушение
+
+## Следующий шаг
+
+После проверки качества `sit/stand` на вашем видео можно расширять логику:
+
+- детекция длительного стояния как полноценного нарушения;
+- резкое перемещение между кадрами;
+- события вставания с места;
+- привязка к зонам парт и рядам для конкретной камеры.
+
+## Использовал Claude 4.6/GPT 5.4 Codex/Открытые источники из интернета
+>>>>>>> balovanie
