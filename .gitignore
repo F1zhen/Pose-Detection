@@ -29,3 +29,5 @@ logs/
 *.pth
 *.onnx
 *.ckpt
+.yolov8n-pose.pt
+.yolov8s-pose.pt
