@@ -225,6 +225,26 @@ datasets/pose_classifier/labeled/
 
 Лучше брать именно из вашей камеры и ваших уроков.
 
+### 2.1. Разметка баловства (Behavior Labeling)
+
+Тот же скрипт поддерживает режим разметки баловства (`normal`, `distracted`, `active`). Для этого укажите аргумент `--task behavior`. Скрипт будет использовать другую целевую папку и другие горячие клавиши:
+
+```bash
+.venv\Scripts\python.exe label_pose_crops.py --task behavior
+```
+
+Горячие клавиши для режима `behavior`:
+- `N` — `normal` (ученик сидит ровно, пишет, слушает)
+- `D` — `distracted` (отвернулся, лежит на парте)
+- `A` — `active` (балуется, дерётся, стоит без причины)
+- `U` — `skip` (пропустить)
+- `Backspace` — отменить последнюю разметку
+
+Скрипт будет работать с папками:
+- Исходники: `datasets/behavior_classifier/unlabeled`
+- Разметка: `datasets/behavior_classifier/labeled/{normal, distracted, active}`
+- Прогресс: `datasets/behavior_classifier/label_progress.csv`
+
 ### 3. Обучить классификатор
 
 ```bash
@@ -349,5 +369,6 @@ datasets/pose_classifier/labeled/
 - резкое перемещение между кадрами;
 - события вставания с места;
 - привязка к зонам парт и рядам для конкретной камеры.
-#   P o s e - D e t e c t i o n  
+#   P o s e - D e t e c t i o n 
+ 
  

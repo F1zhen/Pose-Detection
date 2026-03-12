@@ -11,6 +11,33 @@ from PIL import Image, ImageOps, ImageTk
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
+# ---- Label task configurations ----
+LABEL_TASKS = {
+    "pose": {
+        "title": "Pose Crop Labeler (sit / stand)",
+        "source_dir": Path("datasets/pose_classifier/unlabeled"),
+        "labeled_dir": Path("datasets/pose_classifier/labeled"),
+        "progress_file": Path("datasets/pose_classifier/label_progress.csv"),
+        "labels": [
+            {"name": "sit",   "key": "s", "display": "S=sit",   "color": "#4ec9b0"},
+            {"name": "stand", "key": "w", "display": "W=stand", "color": "#dcdcaa"},
+            {"name": "skip",  "key": "u", "display": "U=skip",  "color": "#808080"},
+        ],
+    },
+    "behavior": {
+        "title": "Behavior Crop Labeler (normal / distracted / active)",
+        "source_dir": Path("datasets/behavior_classifier/unlabeled"),
+        "labeled_dir": Path("datasets/behavior_classifier/labeled"),
+        "progress_file": Path("datasets/behavior_classifier/label_progress.csv"),
+        "labels": [
+            {"name": "normal",     "key": "n", "display": "N=normal",     "color": "#4ec9b0"},
+            {"name": "distracted", "key": "d", "display": "D=distracted", "color": "#dcdcaa"},
+            {"name": "active",     "key": "a", "display": "A=active",     "color": "#f44747"},
+            {"name": "skip",       "key": "u", "display": "U=skip",       "color": "#808080"},
+        ],
+    },
+}
+
 
 @dataclass
 class CropSample:
@@ -20,22 +47,31 @@ class CropSample:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Manual labeling tool for sit/stand person crops."
+        description="Manual labeling tool for person crops."
+    )
+    parser.add_argument(
+        "--task",
+        choices=list(LABEL_TASKS.keys()),
+        default="pose",
+        help="Labeling task: 'pose' (sit/stand) or 'behavior' (normal/distracted/active).",
     )
     parser.add_argument(
         "--source-dir",
         type=Path,
-        default=Path("datasets/pose_classifier/unlabeled"),
+        default=None,
+        help="Source dir with unlabeled crops (default depends on --task).",
     )
     parser.add_argument(
         "--labeled-dir",
         type=Path,
-        default=Path("datasets/pose_classifier/labeled"),
+        default=None,
+        help="Output dir for labeled crops (default depends on --task).",
     )
     parser.add_argument(
         "--progress-file",
         type=Path,
-        default=Path("datasets/pose_classifier/label_progress.csv"),
+        default=None,
+        help="CSV progress file (default depends on --task).",
     )
     parser.add_argument("--window-width", type=int, default=1100)
     parser.add_argument("--window-height", type=int, default=900)
@@ -44,7 +80,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Copy images to labeled folders instead of moving them.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    task_cfg = LABEL_TASKS[args.task]
+    if args.source_dir is None:
+        args.source_dir = task_cfg["source_dir"]
+    if args.labeled_dir is None:
+        args.labeled_dir = task_cfg["labeled_dir"]
+    if args.progress_file is None:
+        args.progress_file = task_cfg["progress_file"]
+    args.task_config = task_cfg
+    return args
 
 
 def collect_samples(source_dir: Path, progress_map: Dict[str, str]) -> List[CropSample]:
@@ -83,21 +129,23 @@ class LabelApp:
         self.current_photo: Optional[ImageTk.PhotoImage] = None
 
         self.args.labeled_dir.mkdir(parents=True, exist_ok=True)
-        (self.args.labeled_dir / "sit").mkdir(parents=True, exist_ok=True)
-        (self.args.labeled_dir / "stand").mkdir(parents=True, exist_ok=True)
-        (self.args.labeled_dir / "skip").mkdir(parents=True, exist_ok=True)
+        task_cfg = self.args.task_config
+        self.label_names = [l["name"] for l in task_cfg["labels"]]
+        for label_name in self.label_names:
+            (self.args.labeled_dir / label_name).mkdir(parents=True, exist_ok=True)
         self.args.progress_file.parent.mkdir(parents=True, exist_ok=True)
 
+        help_parts = [f"{l['display']}" for l in task_cfg["labels"]]
+        help_text = "Keys: " + " | ".join(help_parts) + " | Backspace=undo | Q=quit"
+
         self.root = tk.Tk()
-        self.root.title("Pose Crop Labeler")
+        self.root.title(task_cfg["title"])
         self.root.geometry(f"{self.args.window_width}x{self.args.window_height}")
         self.root.configure(bg="#202124")
 
         self.title_var = tk.StringVar()
         self.path_var = tk.StringVar()
-        self.help_var = tk.StringVar(
-            value="Keys: S=sit | W=stand | U=skip | Backspace=undo | Q=quit"
-        )
+        self.help_var = tk.StringVar(value=help_text)
 
         self.header_label = tk.Label(
             self.root,
@@ -129,9 +177,10 @@ class LabelApp:
         )
         self.help_label.pack(pady=(0, 12))
 
-        self.root.bind("s", lambda event: self.assign_label("sit"))
-        self.root.bind("w", lambda event: self.assign_label("stand"))
-        self.root.bind("u", lambda event: self.assign_label("skip"))
+        for label_cfg in task_cfg["labels"]:
+            key = label_cfg["key"]
+            name = label_cfg["name"]
+            self.root.bind(key, lambda event, lbl=name: self.assign_label(lbl))
         self.root.bind("<BackSpace>", lambda event: self.undo())
         self.root.bind("q", lambda event: self.root.destroy())
 
