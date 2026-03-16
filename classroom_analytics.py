@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import pandas as pd
+import torch
+from torch import nn
 
 
 SUPPORTED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
@@ -19,6 +21,7 @@ POSE_SMOOTHING_WINDOW = 3
 POSE_SCORE_THRESHOLD = 0.15
 MIN_STATE_FRAMES = 3
 MIN_EVENT_DURATION_SEC = 1.0
+RED_BOX_MIN_DURATION_SEC = 3.0
 
 # --- Horseplay detection defaults ---
 HORSEPLAY_PROXIMITY_PX = 120
@@ -33,6 +36,8 @@ HORSEPLAY_STANDING_WEIGHT = 0.5
 POSE_SIT = "sit"
 POSE_STAND = "stand"
 POSE_UNKNOWN = "unknown"
+BEHAVIOR_UNKNOWN = "unknown"
+NORMAL_BEHAVIOR_LABELS = {"normal", "focused", BEHAVIOR_UNKNOWN}
 
 COLOR_SIT = (0, 200, 0)
 COLOR_STAND = (0, 165, 255)
@@ -49,17 +54,29 @@ class DetectionState:
     pose: str
     classifier_pose: Optional[str]
     classifier_confidence: Optional[float]
+    behavior_label: Optional[str]
+    behavior_confidence: Optional[float]
     violation_type: str
     movement_px: Optional[float]
     rapid_motion: bool
     center: Tuple[float, float]
     frame_index: int
     timestamp_sec: float
+    red_box: bool = False
+    red_box_duration_sec: float = 0.0
+    red_box_confirmed: bool = False
     horseplay_score: Optional[float] = None
     horseplay: bool = False
     proximity_ids: str = ""
     oscillation_count: int = 0
     burst_count: int = 0
+
+
+@dataclass
+class TrackClipState:
+    frames: List[np.ndarray]
+    last_label: Optional[str] = None
+    last_confidence: Optional[float] = None
 
 
 @dataclass
@@ -77,6 +94,7 @@ class LiveReportStats:
     current_unknown: int = 0
     current_rapid_motion: int = 0
     current_horseplay: int = 0
+    current_red_boxes: int = 0
 
     def __post_init__(self) -> None:
         if self.unique_people is None:
@@ -94,6 +112,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose-classifier", type=Path, default=None, help="Path to trained sit/stand classifier checkpoint.")
     parser.add_argument("--classifier-threshold", type=float, default=0.65)
     parser.add_argument("--classifier-padding", type=float, default=0.12)
+    parser.add_argument(
+        "--behavior-classifier",
+        type=Path,
+        default=None,
+        help="Path to behavior classifier checkpoint. Supports frame models and the distracted Transformer checkpoint.",
+    )
+    parser.add_argument("--behavior-threshold", type=float, default=0.65)
+    parser.add_argument("--red-box-min-duration-sec", type=float, default=RED_BOX_MIN_DURATION_SEC)
     parser.add_argument(
         "--device",
         default="auto",
@@ -315,6 +341,83 @@ class HorseplayTracker:
         return self.movement_vectors.get(person_id)
 
 
+class RedBoxTracker:
+    def __init__(self) -> None:
+        self.active_start_times: Dict[int, float] = {}
+
+    def update(self, person_id: int, is_red: bool, timestamp_sec: float) -> float:
+        if not is_red:
+            self.active_start_times.pop(person_id, None)
+            return 0.0
+
+        start_time = self.active_start_times.setdefault(person_id, timestamp_sec)
+        return max(0.0, timestamp_sec - start_time)
+
+
+class PositionalEncoding:
+    def __init__(self, dim: int, torch_module, dropout: float = 0.1, max_len: int = 512) -> None:
+        self.dropout = torch_module.nn.Dropout(dropout)
+        position = torch_module.arange(max_len).unsqueeze(1)
+        div_term = torch_module.exp(torch_module.arange(0, dim, 2) * (-np.log(10000.0) / dim))
+        pe = torch_module.zeros(max_len, dim)
+        pe[:, 0::2] = torch_module.sin(position * div_term)
+        pe[:, 1::2] = torch_module.cos(position * div_term)
+        self.pe = pe.unsqueeze(0)
+
+    def to(self, device):
+        self.pe = self.pe.to(device)
+        return self
+
+    def __call__(self, x):
+        x = x + self.pe[:, : x.size(1)]
+        return self.dropout(x)
+
+
+class TemporalTransformerClassifier(nn.Module):
+    def __init__(
+        self,
+        backbone_name: str,
+        num_classes: int,
+        transformer_dim: int,
+        num_heads: int,
+        num_layers: int,
+        dropout: float,
+        models_module,
+        nn_module,
+    ) -> None:
+        super().__init__()
+        self.frame_encoder, encoder_dim = build_temporal_frame_encoder(backbone_name, models_module, nn_module)
+        self.projection = nn_module.Linear(encoder_dim, transformer_dim)
+        self.cls_token = nn_module.Parameter(torch.zeros(1, 1, transformer_dim))
+        nn_module.init.normal_(self.cls_token, std=0.02)
+        self.position = PositionalEncoding(transformer_dim, torch, dropout=dropout, max_len=1024)
+        encoder_layer = nn_module.TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=num_heads,
+            dim_feedforward=transformer_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn_module.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn_module.LayerNorm(transformer_dim)
+        self.head = nn_module.Linear(transformer_dim, num_classes)
+
+    def forward(self, clips: torch.Tensor) -> torch.Tensor:
+        batch_size, time_steps, channels, height, width = clips.shape
+        frames = clips.view(batch_size * time_steps, channels, height, width)
+        frame_features = self.frame_encoder(frames)
+        frame_features = frame_features.view(batch_size, time_steps, -1)
+        tokens = self.projection(frame_features)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        tokens = torch.cat([cls_tokens, tokens], dim=1)
+        tokens = self.position(tokens)
+        encoded = self.transformer(tokens)
+        cls_embedding = self.norm(encoded[:, 0])
+        return self.head(cls_embedding)
+
+
 def build_classifier_model(model_name: str, num_classes: int, models_module, nn_module):
     if model_name == "efficientnet_b0":
         model = models_module.efficientnet_b0(weights=None)
@@ -328,17 +431,69 @@ def build_classifier_model(model_name: str, num_classes: int, models_module, nn_
     raise ValueError(f"Unsupported classifier model_name: {model_name}")
 
 
-def load_pose_classifier(classifier_path: Optional[Path], device, torch_module):
+def build_temporal_frame_encoder(model_name: str, models_module, nn_module):
+    if model_name == "efficientnet_b0":
+        model = models_module.efficientnet_b0(weights=None)
+        encoder = nn_module.Sequential(
+            model.features,
+            model.avgpool,
+            nn_module.Flatten(),
+        )
+        return encoder, 1280
+    if model_name == "resnet18":
+        model = models_module.resnet18(weights=None)
+        encoder = nn_module.Sequential(*list(model.children())[:-1], nn_module.Flatten())
+        return encoder, model.fc.in_features
+    raise ValueError(f"Unsupported temporal backbone model_name: {model_name}")
+
+
+def load_classifier_bundle(classifier_path: Optional[Path], device, torch_module):
     if classifier_path is None:
         return None
 
     from PIL import Image
     from torchvision import models, transforms
 
-    checkpoint = torch_module.load(classifier_path, map_location=device)
+    load_kwargs = {"map_location": device}
+    try:
+        checkpoint = torch_module.load(classifier_path, weights_only=True, **load_kwargs)
+    except TypeError:
+        checkpoint = torch_module.load(classifier_path, **load_kwargs)
     model_name = checkpoint["model_name"]
     class_names = checkpoint["class_names"]
     image_size = checkpoint["image_size"]
+
+    if "frames_per_clip" in checkpoint and "transformer_dim" in checkpoint:
+        model = TemporalTransformerClassifier(
+            backbone_name=model_name,
+            num_classes=len(class_names),
+            transformer_dim=checkpoint["transformer_dim"],
+            num_heads=checkpoint["transformer_heads"],
+            num_layers=checkpoint["transformer_layers"],
+            dropout=checkpoint.get("dropout", 0.1),
+            models_module=models,
+            nn_module=torch_module.nn,
+        )
+        model.load_state_dict(checkpoint["state_dict"])
+        model.to(device)
+        model.eval()
+        model.position.to(device)
+        transform = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        return {
+            "kind": "temporal",
+            "model": model,
+            "class_names": class_names,
+            "transform": transform,
+            "torch": torch_module,
+            "pil_image": Image,
+            "frames_per_clip": checkpoint["frames_per_clip"],
+        }
 
     model = build_classifier_model(
         model_name=model_name,
@@ -358,6 +513,7 @@ def load_pose_classifier(classifier_path: Optional[Path], device, torch_module):
         ]
     )
     return {
+        "kind": "frame",
         "model": model,
         "class_names": class_names,
         "transform": transform,
@@ -399,11 +555,107 @@ def classify_crop_with_model(
 
     confidence_value = float(confidence.item())
     if confidence_value < threshold:
-        return POSE_UNKNOWN, confidence_value
+        return None, confidence_value
     return str(classifier_bundle["class_names"][int(index.item())]), confidence_value
 
 
-def select_box_color(pose: str, violation_type: str, is_horseplay: bool = False) -> Tuple[int, int, int]:
+def update_track_clip_state(
+    frame: np.ndarray,
+    bbox_xyxy: np.ndarray,
+    person_id: int,
+    clip_state_map: Dict[int, TrackClipState],
+    frames_per_clip: int,
+    padding_ratio: float,
+) -> Optional[List[np.ndarray]]:
+    frame_height, frame_width = frame.shape[:2]
+    left, top, right, bottom = expand_bbox(
+        bbox_xyxy=bbox_xyxy,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        padding_ratio=padding_ratio,
+    )
+    crop = frame[top:bottom, left:right]
+    if crop.size == 0:
+        return None
+
+    state = clip_state_map.setdefault(person_id, TrackClipState(frames=[]))
+    state.frames.append(crop.copy())
+    if len(state.frames) > frames_per_clip:
+        state.frames = state.frames[-frames_per_clip:]
+    if len(state.frames) < frames_per_clip:
+        return None
+    return state.frames
+
+
+def classify_track_with_temporal_model(
+    frame: np.ndarray,
+    bbox_xyxy: np.ndarray,
+    person_id: int,
+    classifier_bundle,
+    threshold: float,
+    padding_ratio: float,
+    clip_state_map: Dict[int, TrackClipState],
+) -> Tuple[Optional[str], Optional[float]]:
+    if classifier_bundle is None:
+        return None, None
+    if classifier_bundle.get("kind") != "temporal":
+        return classify_crop_with_model(frame, bbox_xyxy, classifier_bundle, threshold, padding_ratio)
+
+    clip_frames = update_track_clip_state(
+        frame=frame,
+        bbox_xyxy=bbox_xyxy,
+        person_id=person_id,
+        clip_state_map=clip_state_map,
+        frames_per_clip=classifier_bundle["frames_per_clip"],
+        padding_ratio=padding_ratio,
+    )
+    state = clip_state_map.setdefault(person_id, TrackClipState(frames=[]))
+    if clip_frames is None:
+        return state.last_label, state.last_confidence
+
+    transformed_frames = []
+    for crop in clip_frames:
+        rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        pil_image = classifier_bundle["pil_image"].fromarray(rgb_crop)
+        transformed_frames.append(classifier_bundle["transform"](pil_image))
+    clip_tensor = classifier_bundle["torch"].stack(transformed_frames, dim=0).unsqueeze(0)
+    clip_tensor = clip_tensor.to(next(classifier_bundle["model"].parameters()).device)
+
+    with classifier_bundle["torch"].no_grad():
+        logits = classifier_bundle["model"](clip_tensor)
+        probabilities = classifier_bundle["torch"].softmax(logits, dim=1)[0]
+        confidence, index = probabilities.max(dim=0)
+
+    confidence_value = float(confidence.item())
+    if confidence_value < threshold:
+        state.last_label = None
+        state.last_confidence = confidence_value
+        return None, confidence_value
+
+    label = str(classifier_bundle["class_names"][int(index.item())])
+    state.last_label = label
+    state.last_confidence = confidence_value
+    return label, confidence_value
+
+
+def prune_track_clip_states(
+    clip_state_map: Dict[int, TrackClipState],
+    active_person_ids: List[int],
+) -> None:
+    active = set(active_person_ids)
+    stale_ids = [person_id for person_id in clip_state_map if person_id not in active]
+    for person_id in stale_ids:
+        clip_state_map.pop(person_id, None)
+
+
+def select_box_color(
+    pose: str,
+    violation_type: str,
+    is_horseplay: bool = False,
+    is_red_box: bool = False,
+) -> Tuple[int, int, int]:
+    if is_red_box:
+        return COLOR_VIOLATION
     if is_horseplay:
         return COLOR_HORSEPLAY
     if violation_type:
@@ -475,6 +727,7 @@ def update_live_report_stats(
     live_stats.current_unknown = sum(1 for state in states.values() if state.pose == POSE_UNKNOWN)
     live_stats.current_rapid_motion = sum(1 for state in states.values() if state.rapid_motion)
     live_stats.current_horseplay = sum(1 for state in states.values() if state.horseplay)
+    live_stats.current_red_boxes = sum(1 for state in states.values() if state.red_box_confirmed)
 
 
 def draw_live_report_panel(
@@ -494,6 +747,7 @@ def draw_live_report_panel(
         lines.extend(
             [
                 f"now sit={live_stats.current_sit} stand={live_stats.current_stand} unk={live_stats.current_unknown}",
+                f"red boxes 3s={live_stats.current_red_boxes}",
             ]
         )
 
@@ -555,7 +809,12 @@ def annotate_frame(
 
     for state in states.values():
         x1, y1, x2, y2 = state.bbox
-        color = select_box_color(state.pose, state.violation_type, is_horseplay=state.horseplay)
+        color = select_box_color(
+            state.pose,
+            state.violation_type,
+            is_horseplay=state.horseplay,
+            is_red_box=state.red_box,
+        )
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness=2)
 
         lines = [f"ID {state.person_id}"]
@@ -565,6 +824,13 @@ def annotate_frame(
             if state.classifier_confidence is not None:
                 cls_line += f" {state.classifier_confidence:.2f}"
             lines.append(cls_line)
+            if state.behavior_label and state.behavior_label.lower() not in NORMAL_BEHAVIOR_LABELS:
+                behavior_line = f"beh={state.behavior_label}"
+                if state.behavior_confidence is not None:
+                    behavior_line += f" {state.behavior_confidence:.2f}"
+                lines.append(behavior_line)
+            if state.red_box_confirmed:
+                lines.append(f"red {state.red_box_duration_sec:.1f}s")
         if state.horseplay:
             lines.append(f"!! horseplay {state.horseplay_score:.1f}")
         elif state.violation_type:
@@ -622,6 +888,8 @@ def count_only_states(result, frame_index: int, timestamp_sec: float) -> Tuple[D
             pose=POSE_UNKNOWN,
             classifier_pose=None,
             classifier_confidence=None,
+            behavior_label=None,
+            behavior_confidence=None,
             violation_type="",
             movement_px=None,
             rapid_motion=False,
@@ -652,7 +920,10 @@ def results_to_states(
     args: argparse.Namespace,
     pose_history: Dict[int, List[str]],
     previous_centers: Dict[int, Tuple[float, float]],
-    classifier_bundle,
+    pose_classifier_bundle,
+    behavior_classifier_bundle,
+    behavior_clip_states: Optional[Dict[int, TrackClipState]] = None,
+    red_box_tracker: Optional["RedBoxTracker"] = None,
     horseplay_tracker: Optional["HorseplayTracker"] = None,
 ) -> Tuple[Dict[int, DetectionState], List[Dict[str, object]]]:
     states: Dict[int, DetectionState] = {}
@@ -665,16 +936,36 @@ def results_to_states(
     boxes_xyxy = result.boxes.xyxy.cpu().numpy()
     track_ids = result.boxes.id.int().cpu().tolist()
     box_confidences = result.boxes.conf.cpu().numpy()
+    if behavior_clip_states is not None:
+        prune_track_clip_states(behavior_clip_states, track_ids)
 
     for idx, person_id in enumerate(track_ids):
         bbox = boxes_xyxy[idx]
         classifier_pose, classifier_confidence = classify_crop_with_model(
             frame=frame,
             bbox_xyxy=bbox,
-            classifier_bundle=classifier_bundle,
+            classifier_bundle=pose_classifier_bundle,
             threshold=args.classifier_threshold,
             padding_ratio=args.classifier_padding,
         )
+        if behavior_classifier_bundle is not None and behavior_classifier_bundle.get("kind") == "temporal":
+            behavior_label, behavior_confidence = classify_track_with_temporal_model(
+                frame=frame,
+                bbox_xyxy=bbox,
+                person_id=person_id,
+                classifier_bundle=behavior_classifier_bundle,
+                threshold=args.behavior_threshold,
+                padding_ratio=args.classifier_padding,
+                clip_state_map=behavior_clip_states if behavior_clip_states is not None else {},
+            )
+        else:
+            behavior_label, behavior_confidence = classify_crop_with_model(
+                frame=frame,
+                bbox_xyxy=bbox,
+                classifier_bundle=behavior_classifier_bundle,
+                threshold=args.behavior_threshold,
+                padding_ratio=args.classifier_padding,
+            )
         pose_value = classifier_pose or POSE_UNKNOWN
         pose = smooth_pose(
             person_id=person_id,
@@ -696,6 +987,22 @@ def results_to_states(
         if args.mode == "analyze":
             if rapid_motion:
                 violation_type = append_violation(violation_type, "rapid_motion")
+        normalized_behavior_label = behavior_label.lower() if behavior_label else None
+        red_box = bool(
+            normalized_behavior_label
+            and normalized_behavior_label not in NORMAL_BEHAVIOR_LABELS
+        )
+        red_box_duration_sec = (
+            red_box_tracker.update(person_id, red_box, timestamp_sec)
+            if red_box_tracker is not None
+            else 0.0
+        )
+        red_box_confirmed = red_box and red_box_duration_sec >= args.red_box_min_duration_sec
+        if red_box:
+            violation_type = append_violation(
+                violation_type,
+                normalized_behavior_label or "behavior",
+            )
 
         previous_centers[person_id] = center
 
@@ -706,9 +1013,14 @@ def results_to_states(
             "pose": pose,
             "classifier_pose": classifier_pose,
             "classifier_confidence": classifier_confidence,
+            "behavior_label": behavior_label,
+            "behavior_confidence": behavior_confidence,
             "violation_type": violation_type,
             "movement_px": movement_px,
             "rapid_motion": rapid_motion,
+            "red_box": red_box,
+            "red_box_duration_sec": red_box_duration_sec,
+            "red_box_confirmed": red_box_confirmed,
             "center": center,
             "dx": center[0] - previous_center[0] if previous_center is not None else 0.0,
             "dy": center[1] - previous_center[1] if previous_center is not None else 0.0,
@@ -800,12 +1112,17 @@ def results_to_states(
             pose=d["pose"],
             classifier_pose=d["classifier_pose"],
             classifier_confidence=safe_float(d["classifier_confidence"]),
+            behavior_label=d["behavior_label"],
+            behavior_confidence=safe_float(d["behavior_confidence"]),
             violation_type=violation_type,
             movement_px=safe_float(d["movement_px"]),
             rapid_motion=d["rapid_motion"],
             center=d["center"],
             frame_index=frame_index,
             timestamp_sec=timestamp_sec,
+            red_box=d["red_box"],
+            red_box_duration_sec=safe_float(d["red_box_duration_sec"]) or 0.0,
+            red_box_confirmed=d["red_box_confirmed"],
             horseplay_score=safe_float(horseplay_score) if hp_enabled else None,
             horseplay=horseplay_flag,
             proximity_ids=proximity_ids_str,
@@ -824,12 +1141,17 @@ def results_to_states(
                 "pose": d["pose"],
                 "classifier_pose": d["classifier_pose"],
                 "classifier_confidence": safe_float(d["classifier_confidence"]),
+                "behavior_label": d["behavior_label"],
+                "behavior_confidence": safe_float(d["behavior_confidence"]),
                 "movement_px": safe_float(d["movement_px"]),
                 "rapid_motion": d["rapid_motion"],
                 "bbox_x1": state.bbox[0],
                 "bbox_y1": state.bbox[1],
                 "bbox_x2": state.bbox[2],
                 "bbox_y2": state.bbox[3],
+                "red_box": d["red_box"],
+                "red_box_duration_sec": safe_float(d["red_box_duration_sec"]),
+                "red_box_confirmed": d["red_box_confirmed"],
                 "horseplay_score": safe_float(horseplay_score) if hp_enabled else None,
                 "horseplay": horseplay_flag,
                 "proximity_ids": proximity_ids_str,
@@ -1185,7 +1507,6 @@ def create_video_writer(output_path: Path, fps: float, frame_size: Tuple[int, in
 
 def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     try:
-        import torch
         from ultralytics import YOLO
     except OSError as exc:
         raise RuntimeError(
@@ -1205,7 +1526,8 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     model = YOLO(args.model)
     if not args.count_only and args.pose_classifier is None:
         raise ValueError("`--pose-classifier` is required when not using `--count-only`.")
-    classifier_bundle = None if args.count_only else load_pose_classifier(args.pose_classifier, torch_device, torch)
+    pose_classifier_bundle = None if args.count_only else load_classifier_bundle(args.pose_classifier, torch_device, torch)
+    behavior_classifier_bundle = None if args.count_only else load_classifier_bundle(args.behavior_classifier, torch_device, torch)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video: {video_path}")
@@ -1221,8 +1543,10 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     report_rows: List[Dict[str, object]] = []
     pose_history: Dict[int, List[str]] = {}
     previous_centers: Dict[int, Tuple[float, float]] = {}
+    behavior_clip_states: Dict[int, TrackClipState] = {}
     last_states: Dict[int, DetectionState] = {}
     live_stats = LiveReportStats()
+    red_box_tracker = None if args.count_only else RedBoxTracker()
     horseplay_tracker = None if args.count_only else HorseplayTracker()
 
     frame_index = 0
@@ -1265,7 +1589,10 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                         args=args,
                         pose_history=pose_history,
                         previous_centers=previous_centers,
-                        classifier_bundle=classifier_bundle,
+                        pose_classifier_bundle=pose_classifier_bundle,
+                        behavior_classifier_bundle=behavior_classifier_bundle,
+                        behavior_clip_states=behavior_clip_states,
+                        red_box_tracker=red_box_tracker,
                         horseplay_tracker=horseplay_tracker,
                     )
                 report_rows.extend(frame_rows)
@@ -1351,12 +1678,17 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                 "pose",
                 "classifier_pose",
                 "classifier_confidence",
+                "behavior_label",
+                "behavior_confidence",
                 "movement_px",
                 "rapid_motion",
                 "bbox_x1",
                 "bbox_y1",
                 "bbox_x2",
                 "bbox_y2",
+                "red_box",
+                "red_box_duration_sec",
+                "red_box_confirmed",
                 "horseplay_score",
                 "horseplay",
                 "proximity_ids",
@@ -1391,6 +1723,8 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     print(f"Device: {device}")
     if args.pose_classifier and not args.count_only:
         print(f"Pose classifier: {console_safe(args.pose_classifier)}")
+    if args.behavior_classifier and not args.count_only:
+        print(f"Behavior classifier: {console_safe(args.behavior_classifier)}")
     print(f"Annotated video: {console_safe(output_paths['video'])}")
     print(f"Excel report: {console_safe(output_paths['xlsx'])}")
     print(summary_text.strip())
