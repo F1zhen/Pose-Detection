@@ -52,6 +52,18 @@ LABEL_TASKS = {
             {"name": "skip",       "key": "u", "display": "U=skip",       "color": "#808080"},
         ],
     },
+    "horseplay": {
+        "title": "Horseplay Clip Labeler (not_horseplay / horseplay)",
+        "source_dir": Path("datasets/horseplay_classifier/unlabeled"),
+        "labeled_dir": Path("datasets/horseplay_classifier/labeled"),
+        "progress_file": Path("datasets/horseplay_classifier/label_progress.csv"),
+        "media_type": "video",
+        "labels": [
+            {"name": "not_horseplay", "key": "n", "display": "N=not_horseplay", "color": "#4ec9b0"},
+            {"name": "horseplay",     "key": "h", "display": "H=horseplay",     "color": "#f44747"},
+            {"name": "skip",          "key": "u", "display": "U=skip",          "color": "#808080"},
+        ],
+    },
 }
 
 
@@ -69,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         "--task",
         choices=list(LABEL_TASKS.keys()),
         default="pose",
-        help="Labeling task: 'pose', 'behavior', or 'distracted'.",
+        help="Labeling task: 'pose', 'behavior', 'distracted', or 'horseplay'.",
     )
     parser.add_argument(
         "--source-dir",

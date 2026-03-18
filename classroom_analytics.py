@@ -38,6 +38,9 @@ POSE_STAND = "stand"
 POSE_UNKNOWN = "unknown"
 BEHAVIOR_UNKNOWN = "unknown"
 NORMAL_BEHAVIOR_LABELS = {"normal", "focused", BEHAVIOR_UNKNOWN}
+NON_FIGHT_LABELS = {"nonfight", "non-fight", "non_fight", "normal", "no_fight", "no-fight", "negative"}
+KINETICS_MEAN = torch.tensor([0.43216, 0.394666, 0.37645], dtype=torch.float32).view(3, 1, 1, 1)
+KINETICS_STD = torch.tensor([0.22803, 0.22145, 0.216989], dtype=torch.float32).view(3, 1, 1, 1)
 
 COLOR_SIT = (0, 200, 0)
 COLOR_STAND = (0, 165, 255)
@@ -80,6 +83,13 @@ class TrackClipState:
 
 
 @dataclass
+class GlobalClipState:
+    frames: List[np.ndarray]
+    last_label: Optional[str] = None
+    last_confidence: Optional[float] = None
+
+
+@dataclass
 class LiveReportStats:
     analyzed_frames: int = 0
     unique_people: set[int] | None = None
@@ -95,6 +105,8 @@ class LiveReportStats:
     current_rapid_motion: int = 0
     current_horseplay: int = 0
     current_red_boxes: int = 0
+    fight_frames: int = 0
+    current_fight: bool = False
 
     def __post_init__(self) -> None:
         if self.unique_people is None:
@@ -119,6 +131,8 @@ def parse_args() -> argparse.Namespace:
         help="Path to behavior classifier checkpoint. Supports frame models and the distracted Transformer checkpoint.",
     )
     parser.add_argument("--behavior-threshold", type=float, default=0.65)
+    parser.add_argument("--fight-classifier", type=Path, default=None, help="Path to trained fight / non-fight video classifier checkpoint.")
+    parser.add_argument("--fight-threshold", type=float, default=0.75)
     parser.add_argument("--red-box-min-duration-sec", type=float, default=RED_BOX_MIN_DURATION_SEC)
     parser.add_argument(
         "--device",
@@ -522,6 +536,118 @@ def load_classifier_bundle(classifier_path: Optional[Path], device, torch_module
     }
 
 
+def build_fight_classifier_model(model_name: str, num_classes: int):
+    from torchvision.models import video as video_models
+
+    if model_name == "r3d_18":
+        model = video_models.r3d_18(weights=None)
+    elif model_name == "mc3_18":
+        model = video_models.mc3_18(weights=None)
+    elif model_name == "r2plus1d_18":
+        model = video_models.r2plus1d_18(weights=None)
+    else:
+        raise ValueError(f"Unsupported fight classifier model_name: {model_name}")
+
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
+    return model
+
+
+def load_fight_classifier_bundle(classifier_path: Optional[Path], device, torch_module):
+    if classifier_path is None:
+        return None
+
+    load_kwargs = {"map_location": device}
+    try:
+        checkpoint = torch_module.load(classifier_path, weights_only=True, **load_kwargs)
+    except TypeError:
+        checkpoint = torch_module.load(classifier_path, **load_kwargs)
+
+    model_name = checkpoint["model_name"]
+    class_names = checkpoint["class_names"]
+    image_size = int(checkpoint["image_size"])
+    num_frames = int(checkpoint["num_frames"])
+
+    model = build_fight_classifier_model(model_name, len(class_names))
+    model.load_state_dict(checkpoint["state_dict"])
+    model.to(device)
+    model.eval()
+
+    return {
+        "kind": "fight_video",
+        "model": model,
+        "class_names": class_names,
+        "torch": torch_module,
+        "image_size": image_size,
+        "num_frames": num_frames,
+    }
+
+
+def update_global_clip_state(
+    frame: np.ndarray,
+    clip_state: GlobalClipState,
+    frames_per_clip: int,
+) -> Optional[List[np.ndarray]]:
+    clip_state.frames.append(frame.copy())
+    if len(clip_state.frames) > frames_per_clip:
+        clip_state.frames = clip_state.frames[-frames_per_clip:]
+    if len(clip_state.frames) < frames_per_clip:
+        return None
+    return clip_state.frames
+
+
+def classify_global_clip_with_model(
+    frame: np.ndarray,
+    classifier_bundle,
+    threshold: float,
+    clip_state: GlobalClipState,
+) -> Tuple[Optional[str], Optional[float]]:
+    if classifier_bundle is None:
+        return None, None
+
+    clip_frames = update_global_clip_state(
+        frame=frame,
+        clip_state=clip_state,
+        frames_per_clip=classifier_bundle["num_frames"],
+    )
+    if clip_frames is None:
+        return clip_state.last_label, clip_state.last_confidence
+
+    transformed_frames = []
+    image_size = classifier_bundle["image_size"]
+    for clip_frame in clip_frames:
+        rgb_frame = cv2.cvtColor(clip_frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb_frame, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+        tensor = classifier_bundle["torch"].from_numpy(resized).permute(2, 0, 1).float() / 255.0
+        transformed_frames.append(tensor)
+
+    clip_tensor = classifier_bundle["torch"].stack(transformed_frames, dim=1).unsqueeze(0)
+    clip_tensor = (clip_tensor - KINETICS_MEAN.to(clip_tensor.device)) / KINETICS_STD.to(clip_tensor.device)
+    clip_tensor = clip_tensor.to(next(classifier_bundle["model"].parameters()).device)
+
+    with classifier_bundle["torch"].no_grad():
+        logits = classifier_bundle["model"](clip_tensor)
+        probabilities = classifier_bundle["torch"].softmax(logits, dim=1)[0]
+        confidence, index = probabilities.max(dim=0)
+
+    confidence_value = float(confidence.item())
+    if confidence_value < threshold:
+        clip_state.last_label = None
+        clip_state.last_confidence = confidence_value
+        return None, confidence_value
+
+    label = str(classifier_bundle["class_names"][int(index.item())])
+    clip_state.last_label = label
+    clip_state.last_confidence = confidence_value
+    return label, confidence_value
+
+
+def is_fight_label(label: Optional[str]) -> bool:
+    if not label:
+        return False
+    return label.strip().lower() not in NON_FIGHT_LABELS
+
+
 def classify_crop_with_model(
     frame: np.ndarray,
     bbox_xyxy: np.ndarray,
@@ -717,6 +843,8 @@ def update_live_report_stats(
                 live_stats.rapid_motion_frames += 1
             if bool(row.get("horseplay", False)):
                 live_stats.horseplay_frames += 1
+            if bool(row.get("fight_detected", False)):
+                live_stats.fight_frames += 1
 # текущее число людей на экране.
     live_stats.current_people = len(states)
     if count_only:
@@ -728,6 +856,7 @@ def update_live_report_stats(
     live_stats.current_rapid_motion = sum(1 for state in states.values() if state.rapid_motion)
     live_stats.current_horseplay = sum(1 for state in states.values() if state.horseplay)
     live_stats.current_red_boxes = sum(1 for state in states.values() if state.red_box_confirmed)
+    live_stats.current_fight = any("fight" in str(state.violation_type).lower() for state in states.values())
 
 
 def draw_live_report_panel(
@@ -748,6 +877,7 @@ def draw_live_report_panel(
             [
                 f"now sit={live_stats.current_sit} stand={live_stats.current_stand} unk={live_stats.current_unknown}",
                 f"red boxes 3s={live_stats.current_red_boxes}",
+                f"fight={'yes' if live_stats.current_fight else 'no'}",
             ]
         )
 
@@ -786,6 +916,9 @@ def annotate_frame(
     mode: str,
     live_stats: Optional[LiveReportStats] = None,
     count_only: bool = False,
+    fight_label: Optional[str] = None,
+    fight_confidence: Optional[float] = None,
+    fight_active: bool = False,
 ) -> np.ndarray:
     annotated = frame.copy()
 
@@ -837,6 +970,24 @@ def annotate_frame(
             lines.append(f"violation: {state.violation_type}")
 
         draw_label(annotated, (x1, max(25, y1)), lines, color)
+
+    if fight_label:
+        banner = f"fight={fight_label}"
+        if fight_confidence is not None:
+            banner += f" {fight_confidence:.2f}"
+        banner_color = COLOR_VIOLATION if fight_active else (90, 90, 90)
+        cv2.rectangle(annotated, (10, 42), (280, 70), COLOR_TEXT_BG, thickness=-1)
+        cv2.rectangle(annotated, (10, 42), (280, 70), banner_color, thickness=1)
+        cv2.putText(
+            annotated,
+            banner,
+            (18, 62),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
     timestamp_label = f"{format_timestamp(timestamp_sec)} | frame {frame_index}"
     cv2.rectangle(annotated, (10, 10), (300, 38), COLOR_TEXT_BG, thickness=-1)
@@ -1326,6 +1477,51 @@ def build_events(state_df: pd.DataFrame, min_event_duration_sec: float) -> pd.Da
                     }
                 )
 
+    if "fight_detected" in ordered.columns:
+        for person_id, group in ordered.groupby("person_id", sort=False):
+            rows = group.reset_index(drop=True)
+            start_idx = None
+            for idx, row in rows.iterrows():
+                is_fight = bool(row.get("fight_detected", False))
+                if is_fight and start_idx is None:
+                    start_idx = idx
+                if not is_fight and start_idx is not None:
+                    start_row = rows.iloc[start_idx]
+                    end_row = rows.iloc[idx - 1]
+                    duration_sec = float(end_row["timestamp_sec"] - start_row["timestamp_sec"])
+                    if duration_sec >= min_event_duration_sec or idx - start_idx >= 1:
+                        events.append(
+                            {
+                                "person_id": int(person_id),
+                                "event_type": "fight_interval",
+                                "start_timestamp": start_row["timestamp"],
+                                "end_timestamp": end_row["timestamp"],
+                                "start_frame": int(start_row["frame"]),
+                                "end_frame": int(end_row["frame"]),
+                                "duration_sec": round(max(duration_sec, 0.0), 3),
+                                "num_observations": int(idx - start_idx),
+                            }
+                        )
+                    start_idx = None
+
+            if start_idx is not None:
+                start_row = rows.iloc[start_idx]
+                end_row = rows.iloc[len(rows) - 1]
+                duration_sec = float(end_row["timestamp_sec"] - start_row["timestamp_sec"])
+                if duration_sec >= min_event_duration_sec or len(rows) - start_idx >= 1:
+                    events.append(
+                        {
+                            "person_id": int(person_id),
+                            "event_type": "fight_interval",
+                            "start_timestamp": start_row["timestamp"],
+                            "end_timestamp": end_row["timestamp"],
+                            "start_frame": int(start_row["frame"]),
+                            "end_frame": int(end_row["frame"]),
+                            "duration_sec": round(max(duration_sec, 0.0), 3),
+                            "num_observations": int(len(rows) - start_idx),
+                        }
+                    )
+
     return pd.DataFrame(events)
 
 
@@ -1346,9 +1542,11 @@ def build_summary(
             "pose_stand_frames": 0,
             "pose_unknown_frames": 0,
             "rapid_motion_frames": 0,
+            "fight_frames": 0,
             "horseplay_frames": 0,
             "standing_intervals": 0,
             "rapid_motion_intervals": 0,
+            "fight_intervals": 0,
             "horseplay_intervals": 0,
             "standing_too_long_intervals": 0,
             "analysis_start": "",
@@ -1363,6 +1561,7 @@ def build_summary(
 
     pose_counts = state_df["stable_pose"].value_counts(dropna=False).to_dict()
     rapid_motion_frames = int(state_df["rapid_motion"].fillna(False).astype(bool).sum()) if "rapid_motion" in state_df.columns else 0
+    fight_frames = int(state_df["fight_detected"].fillna(False).astype(bool).sum()) if "fight_detected" in state_df.columns else 0
     horseplay_frames = int(state_df["horseplay"].fillna(False).astype(bool).sum()) if "horseplay" in state_df.columns else 0
 
     def count_events(event_name: str) -> int:
@@ -1380,9 +1579,11 @@ def build_summary(
         "pose_stand_frames": int(pose_counts.get(POSE_STAND, 0)),
         "pose_unknown_frames": int(pose_counts.get(POSE_UNKNOWN, 0)),
         "rapid_motion_frames": rapid_motion_frames,
+        "fight_frames": fight_frames,
         "horseplay_frames": horseplay_frames,
         "standing_intervals": count_events("standing_interval"),
         "rapid_motion_intervals": count_events("rapid_motion_interval"),
+        "fight_intervals": count_events("fight_interval"),
         "horseplay_intervals": count_events("horseplay_interval"),
         "standing_too_long_intervals": count_events("standing_too_long"),
         "analysis_start": str(state_df["timestamp"].min()),
@@ -1401,9 +1602,11 @@ def build_summary(
                 "stand_frames": int(person_pose_counts.get(POSE_STAND, 0)),
                 "unknown_frames": int(person_pose_counts.get(POSE_UNKNOWN, 0)),
                 "rapid_motion_frames": int(group["rapid_motion"].fillna(False).astype(bool).sum()) if "rapid_motion" in group.columns else 0,
+                "fight_frames": int(group["fight_detected"].fillna(False).astype(bool).sum()) if "fight_detected" in group.columns else 0,
                 "horseplay_frames": int(group["horseplay"].fillna(False).astype(bool).sum()) if "horseplay" in group.columns else 0,
                 "standing_intervals": int((person_events["event_type"] == "standing_interval").sum()) if not person_events.empty else 0,
                 "rapid_motion_intervals": int((person_events["event_type"] == "rapid_motion_interval").sum()) if not person_events.empty else 0,
+                "fight_intervals": int((person_events["event_type"] == "fight_interval").sum()) if not person_events.empty else 0,
                 "horseplay_intervals": int((person_events["event_type"] == "horseplay_interval").sum()) if not person_events.empty else 0,
             }
         )
@@ -1418,9 +1621,11 @@ def build_summary(
         f"Stand frames: {summary_row['pose_stand_frames']}",
         f"Unknown frames: {summary_row['pose_unknown_frames']}",
         f"Rapid-motion frames: {summary_row['rapid_motion_frames']}",
+        f"Fight frames: {summary_row['fight_frames']}",
         f"Horseplay frames: {summary_row['horseplay_frames']}",
         f"Standing intervals: {summary_row['standing_intervals']}",
         f"Rapid-motion intervals: {summary_row['rapid_motion_intervals']}",
+        f"Fight intervals: {summary_row['fight_intervals']}",
         f"Horseplay intervals: {summary_row['horseplay_intervals']}",
         f"Standing-too-long intervals: {summary_row['standing_too_long_intervals']}",
         "",
@@ -1430,7 +1635,7 @@ def build_summary(
         text_lines.append(
             f"ID {row['person_id']}: frames={row['frames']}, "
             f"sit={row['sit_frames']}, stand={row['stand_frames']}, unknown={row['unknown_frames']}, "
-            f"rapid_motion={row['rapid_motion_frames']}, horseplay={row['horseplay_frames']}"
+            f"rapid_motion={row['rapid_motion_frames']}, fight={row['fight_frames']}, horseplay={row['horseplay_frames']}"
         )
 
     return pd.DataFrame([summary_row]), per_person_rows, "\n".join(text_lines) + "\n"
@@ -1528,6 +1733,7 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
         raise ValueError("`--pose-classifier` is required when not using `--count-only`.")
     pose_classifier_bundle = None if args.count_only else load_classifier_bundle(args.pose_classifier, torch_device, torch)
     behavior_classifier_bundle = None if args.count_only else load_classifier_bundle(args.behavior_classifier, torch_device, torch)
+    fight_classifier_bundle = None if args.count_only else load_fight_classifier_bundle(args.fight_classifier, torch_device, torch)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video: {video_path}")
@@ -1544,10 +1750,14 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     pose_history: Dict[int, List[str]] = {}
     previous_centers: Dict[int, Tuple[float, float]] = {}
     behavior_clip_states: Dict[int, TrackClipState] = {}
+    fight_clip_state = GlobalClipState(frames=[])
     last_states: Dict[int, DetectionState] = {}
     live_stats = LiveReportStats()
     red_box_tracker = None if args.count_only else RedBoxTracker()
     horseplay_tracker = None if args.count_only else HorseplayTracker()
+    last_fight_label: Optional[str] = None
+    last_fight_confidence: Optional[float] = None
+    last_fight_active = False
 
     frame_index = 0
     try:
@@ -1595,6 +1805,25 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                         red_box_tracker=red_box_tracker,
                         horseplay_tracker=horseplay_tracker,
                     )
+
+                    if fight_classifier_bundle is not None:
+                        last_fight_label, last_fight_confidence = classify_global_clip_with_model(
+                            frame=frame,
+                            classifier_bundle=fight_classifier_bundle,
+                            threshold=args.fight_threshold,
+                            clip_state=fight_clip_state,
+                        )
+                        last_fight_active = is_fight_label(last_fight_label)
+                        if last_fight_active:
+                            for state in last_states.values():
+                                state.violation_type = append_violation(state.violation_type, "fight")
+
+                    for row in frame_rows:
+                        row["fight_label"] = last_fight_label
+                        row["fight_confidence"] = safe_float(last_fight_confidence)
+                        row["fight_detected"] = last_fight_active
+                        if last_fight_active:
+                            row["violation_type"] = append_violation(str(row.get("violation_type", "")), "fight")
                 report_rows.extend(frame_rows)
                 update_live_report_stats(
                     live_stats=live_stats,
@@ -1611,6 +1840,9 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                 mode=args.mode,
                 live_stats=live_stats,
                 count_only=args.count_only,
+                fight_label=last_fight_label,
+                fight_confidence=last_fight_confidence,
+                fight_active=last_fight_active,
             )
 
             if args.save_every_frame or should_process:
@@ -1680,6 +1912,9 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                 "classifier_confidence",
                 "behavior_label",
                 "behavior_confidence",
+                "fight_label",
+                "fight_confidence",
+                "fight_detected",
                 "movement_px",
                 "rapid_motion",
                 "bbox_x1",
@@ -1725,6 +1960,8 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
         print(f"Pose classifier: {console_safe(args.pose_classifier)}")
     if args.behavior_classifier and not args.count_only:
         print(f"Behavior classifier: {console_safe(args.behavior_classifier)}")
+    if args.fight_classifier and not args.count_only:
+        print(f"Fight classifier: {console_safe(args.fight_classifier)}")
     print(f"Annotated video: {console_safe(output_paths['video'])}")
     print(f"Excel report: {console_safe(output_paths['xlsx'])}")
     print(summary_text.strip())

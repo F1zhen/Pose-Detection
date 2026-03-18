@@ -14,6 +14,8 @@ from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 
 
 CLASS_NAMES = ["focused", "distracted"]
@@ -45,9 +47,86 @@ class ClipDataset(Dataset):
     def __getitem__(self, index: int):
         sample = self.samples[index]
         frames = load_clip_frames(sample.path, self.frames_per_clip)
-        tensor_frames = [self.transform(frame) for frame in frames]
-        clip_tensor = torch.stack(tensor_frames, dim=0)
+        clip_tensor = self.transform(frames)
         return clip_tensor, sample.label
+
+
+class ClipTransform:
+    def __init__(
+        self,
+        image_size: int,
+        train: bool,
+        gaussian_noise_std: float = 0.03,
+    ) -> None:
+        self.image_size = image_size
+        self.train = train
+        self.gaussian_noise_std = gaussian_noise_std
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+        self.color_jitter = transforms.ColorJitter(
+            brightness=0.18,
+            contrast=0.18,
+            saturation=0.12,
+            hue=0.03,
+        )
+
+    def __call__(self, frames: Sequence[Image.Image]) -> torch.Tensor:
+        processed = list(frames)
+
+        if self.train:
+            processed = self._augment_clip(processed)
+        else:
+            processed = [
+                TF.resize(frame, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR)
+                for frame in processed
+            ]
+
+        tensor_frames = []
+        for frame in processed:
+            tensor = TF.to_tensor(frame)
+            if self.train and self.gaussian_noise_std > 0:
+                tensor = tensor + torch.randn_like(tensor) * self.gaussian_noise_std
+                tensor = tensor.clamp(0.0, 1.0)
+            tensor_frames.append(self.normalize(tensor))
+        return torch.stack(tensor_frames, dim=0)
+
+    def _augment_clip(self, frames: Sequence[Image.Image]) -> List[Image.Image]:
+        do_flip = random.random() < 0.5
+        rotation = random.uniform(-8.0, 8.0)
+        crop_scale = random.uniform(0.88, 1.0)
+        crop_size = max(1, int(self.image_size * crop_scale))
+        max_offset = self.image_size - crop_size
+        top = random.randint(0, max_offset) if max_offset > 0 else 0
+        left = random.randint(0, max_offset) if max_offset > 0 else 0
+        brightness_factor = random.uniform(0.82, 1.18)
+        contrast_factor = random.uniform(0.82, 1.18)
+        saturation_factor = random.uniform(0.88, 1.12)
+        hue_factor = random.uniform(-0.03, 0.03)
+
+        augmented: List[Image.Image] = []
+        for frame in frames:
+            img = TF.resize(frame, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR)
+            if do_flip:
+                img = TF.hflip(img)
+            img = TF.rotate(img, rotation, interpolation=InterpolationMode.BILINEAR, fill=0)
+            if crop_scale < 0.999:
+                img = TF.resized_crop(
+                    img,
+                    top=top,
+                    left=left,
+                    height=crop_size,
+                    width=crop_size,
+                    size=[self.image_size, self.image_size],
+                    interpolation=InterpolationMode.BILINEAR,
+                )
+            img = TF.adjust_brightness(img, brightness_factor)
+            img = TF.adjust_contrast(img, contrast_factor)
+            img = TF.adjust_saturation(img, saturation_factor)
+            img = TF.adjust_hue(img, hue_factor)
+            augmented.append(img)
+        return augmented
 
 
 class PositionalEncoding(nn.Module):
@@ -132,13 +211,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transformer-dim", type=int, default=256)
     parser.add_argument("--transformer-heads", type=int, default=8)
     parser.add_argument("--transformer-layers", type=int, default=2)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument(
         "--freeze-backbone-epochs",
         type=int,
-        default=1,
+        default=3,
         help="Freeze the frame encoder for the first N epochs to stabilise training on a small dataset.",
     )
+    parser.add_argument("--gaussian-noise-std", type=float, default=0.03)
+    parser.add_argument("--early-stopping-patience", type=int, default=4)
     return parser.parse_args()
 
 
@@ -265,23 +346,13 @@ def load_clip_frames(clip_path: Path, frames_per_clip: int) -> List[Image.Image]
     return [Image.fromarray(frame) for frame in sampled]
 
 
-def make_transforms(image_size: int):
-    train_transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
+def make_transforms(image_size: int, gaussian_noise_std: float):
+    train_transform = ClipTransform(
+        image_size=image_size,
+        train=True,
+        gaussian_noise_std=gaussian_noise_std,
     )
-    val_transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+    val_transform = ClipTransform(image_size=image_size, train=False, gaussian_noise_std=0.0)
     return train_transform, val_transform
 
 
@@ -353,7 +424,7 @@ def main() -> None:
 
     samples = collect_labeled_samples(args.dataset_root)
     train_samples, val_samples = split_samples(samples, args.val_split, args.seed)
-    train_transform, val_transform = make_transforms(args.image_size)
+    train_transform, val_transform = make_transforms(args.image_size, args.gaussian_noise_std)
 
     train_dataset = ClipDataset(train_samples, train_transform, args.frames_per_clip)
     val_dataset = ClipDataset(val_samples, val_transform, args.frames_per_clip)
@@ -396,6 +467,8 @@ def main() -> None:
     metadata_path = args.output_dir / "training_metadata.json"
 
     best_val_f1 = -1.0
+    best_epoch = 0
+    epochs_without_improvement = 0
     history: List[Dict[str, float]] = []
 
     print(f"Device: {device}")
@@ -448,6 +521,8 @@ def main() -> None:
 
         if val_metrics["f1"] >= best_val_f1:
             best_val_f1 = val_metrics["f1"]
+            best_epoch = epoch
+            epochs_without_improvement = 0
             torch.save(
                 {
                     "model_name": args.model_name,
@@ -462,6 +537,15 @@ def main() -> None:
                 },
                 best_model_path,
             )
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= args.early_stopping_patience:
+            print(
+                f"Early stopping at epoch {epoch}: "
+                f"no val_f1 improvement for {args.early_stopping_patience} epoch(s)."
+            )
+            break
 
     metadata = {
         "dataset_root": str(args.dataset_root),
@@ -477,12 +561,15 @@ def main() -> None:
         "train_clips": len(train_samples),
         "val_clips": len(val_samples),
         "best_val_f1": round(float(best_val_f1), 4),
+        "best_epoch": best_epoch,
         "class_names": CLASS_NAMES,
         "transformer_dim": args.transformer_dim,
         "transformer_heads": args.transformer_heads,
         "transformer_layers": args.transformer_layers,
         "dropout": args.dropout,
         "freeze_backbone_epochs": args.freeze_backbone_epochs,
+        "gaussian_noise_std": args.gaussian_noise_std,
+        "early_stopping_patience": args.early_stopping_patience,
         "history": history,
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
