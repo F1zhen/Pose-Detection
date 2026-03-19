@@ -1,14 +1,11 @@
 import argparse
 import json
-import math
 import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
-import cv2
-import numpy as np
 import torch
 from PIL import Image
 from torch import nn
@@ -19,33 +16,28 @@ from torchvision.transforms import functional as TF
 
 
 CLASS_NAMES = ["focused", "distracted"]
-VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
-CLIP_NAME_PATTERN = re.compile(r"^(?P<video>.+?)_id(?P<track>\d+)_f\d+_f\d+$")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+GROUP_NAME_PATTERN = re.compile(r"^(?P<video>.+?)_f\d+_id(?P<track>[^_]+)_det\d+$")
 
 
 @dataclass(frozen=True)
-class ClipSample:
+class ImageSample:
     path: Path
     label: int
     group_key: str
 
 
-class ClipDataset(Dataset):
-    def __init__(
-        self,
-        samples: Sequence[ClipSample],
-        transform,
-        frames_per_clip: int,
-    ) -> None:
+class CropDataset(Dataset):
+    def __init__(self, samples: Sequence[ImageSample], transform) -> None:
         self.samples = list(samples)
         self.transform = transform
-        self.frames_per_clip = frames_per_clip
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int):
         sample = self.samples[index]
+<<<<<<< HEAD
         frames = load_clip_frames(sample.path, self.frames_per_clip)
         clip_tensor = self.transform(frames)
         return clip_tensor, sample.label
@@ -189,18 +181,21 @@ class TemporalTransformerClassifier(nn.Module):
         encoded = self.transformer(tokens)
         cls_embedding = self.norm(encoded[:, 0])
         return self.head(cls_embedding)
+=======
+        image = Image.open(sample.path).convert("RGB")
+        return self.transform(image), sample.label
+>>>>>>> origin/feature/map
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a distracted/focused clip classifier with a temporal Transformer head."
+        description="Train a distracted/focused image classifier on person crops."
     )
     parser.add_argument("--dataset-root", type=Path, default=Path("datasets/distracted_classifier/labeled"))
     parser.add_argument("--output-dir", type=Path, default=Path("models/distracted_classifier"))
-    parser.add_argument("--model-name", choices=["resnet18", "efficientnet_b0"], default="resnet18")
+    parser.add_argument("--model-name", choices=["efficientnet_b0", "resnet18"], default="resnet18")
     parser.add_argument("--epochs", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--frames-per-clip", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -208,6 +203,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--device", default="auto")
+<<<<<<< HEAD
     parser.add_argument("--transformer-dim", type=int, default=256)
     parser.add_argument("--transformer-heads", type=int, default=8)
     parser.add_argument("--transformer-layers", type=int, default=2)
@@ -220,64 +216,65 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gaussian-noise-std", type=float, default=0.03)
     parser.add_argument("--early-stopping-patience", type=int, default=4)
+=======
+>>>>>>> origin/feature/map
     return parser.parse_args()
 
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
-    np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-def infer_group_key(clip_path: Path) -> str:
-    match = CLIP_NAME_PATTERN.match(clip_path.stem)
+def infer_group_key(image_path: Path) -> str:
+    match = GROUP_NAME_PATTERN.match(image_path.stem)
     if match:
         return f"{match.group('video')}|track_{match.group('track')}"
-    return f"{clip_path.parent.name}|{clip_path.stem}"
+    return f"{image_path.parent.name}|{image_path.stem}"
 
 
-def collect_labeled_samples(dataset_root: Path) -> List[ClipSample]:
-    samples: List[ClipSample] = []
+def collect_labeled_samples(dataset_root: Path) -> List[ImageSample]:
+    samples: List[ImageSample] = []
     for class_index, class_name in enumerate(CLASS_NAMES):
         class_dir = dataset_root / class_name
         if not class_dir.exists():
             continue
-        for clip_path in sorted(class_dir.rglob("*")):
-            if clip_path.suffix.lower() not in VIDEO_EXTENSIONS:
+        for image_path in sorted(class_dir.rglob("*")):
+            if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
             samples.append(
-                ClipSample(
-                    path=clip_path,
+                ImageSample(
+                    path=image_path,
                     label=class_index,
-                    group_key=infer_group_key(clip_path),
+                    group_key=infer_group_key(image_path),
                 )
             )
     if not samples:
         raise FileNotFoundError(
-            f"No labeled clips found under {dataset_root}. "
+            f"No labeled images found under {dataset_root}. "
             "Expected folders like labeled/focused and labeled/distracted."
         )
     return samples
 
 
 def split_samples(
-    samples: Sequence[ClipSample],
+    samples: Sequence[ImageSample],
     val_split: float,
     seed: int,
-) -> Tuple[List[ClipSample], List[ClipSample]]:
-    grouped: Dict[Tuple[int, str], List[ClipSample]] = {}
+) -> Tuple[List[ImageSample], List[ImageSample]]:
+    grouped: Dict[Tuple[int, str], List[ImageSample]] = {}
     for sample in samples:
         grouped.setdefault((sample.label, sample.group_key), []).append(sample)
 
-    by_class_groups: Dict[int, List[List[ClipSample]]] = {0: [], 1: []}
+    by_class_groups: Dict[int, List[List[ImageSample]]] = {index: [] for index in range(len(CLASS_NAMES))}
     for (label, _group_key), group_samples in grouped.items():
         by_class_groups[label].append(group_samples)
 
     rng = random.Random(seed)
-    train_samples: List[ClipSample] = []
-    val_samples: List[ClipSample] = []
+    train_samples: List[ImageSample] = []
+    val_samples: List[ImageSample] = []
 
     for class_index, groups in by_class_groups.items():
         rng.shuffle(groups)
@@ -299,69 +296,51 @@ def split_samples(
     return train_samples, val_samples
 
 
-def build_frame_encoder(model_name: str) -> Tuple[nn.Module, int]:
+def build_model(model_name: str) -> nn.Module:
     if model_name == "efficientnet_b0":
         weights = models.EfficientNet_B0_Weights.DEFAULT
         model = models.efficientnet_b0(weights=weights)
-        encoder = nn.Sequential(
-            model.features,
-            model.avgpool,
-            nn.Flatten(),
-        )
-        return encoder, 1280
+        in_features = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(in_features, len(CLASS_NAMES))
+        return model
 
     weights = models.ResNet18_Weights.DEFAULT
     model = models.resnet18(weights=weights)
-    encoder = nn.Sequential(*list(model.children())[:-1], nn.Flatten())
-    return encoder, model.fc.in_features
+    model.fc = nn.Linear(model.fc.in_features, len(CLASS_NAMES))
+    return model
 
 
-def load_clip_frames(clip_path: Path, frames_per_clip: int) -> List[Image.Image]:
-    capture = cv2.VideoCapture(str(clip_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Unable to open clip: {clip_path}")
-
-    frames: List[np.ndarray] = []
-    try:
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(rgb)
-    finally:
-        capture.release()
-
-    if not frames:
-        raise RuntimeError(f"Clip contains no readable frames: {clip_path}")
-
-    if len(frames) >= frames_per_clip:
-        indices = np.linspace(0, len(frames) - 1, frames_per_clip, dtype=int)
-        sampled = [frames[idx] for idx in indices]
-    else:
-        sampled = list(frames)
-        while len(sampled) < frames_per_clip:
-            sampled.append(sampled[-1])
-
-    return [Image.fromarray(frame) for frame in sampled]
-
-
+<<<<<<< HEAD
 def make_transforms(image_size: int, gaussian_noise_std: float):
     train_transform = ClipTransform(
         image_size=image_size,
         train=True,
         gaussian_noise_std=gaussian_noise_std,
+=======
+def make_transforms(image_size: int):
+    train_transform = transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=6),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    val_transform = transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+>>>>>>> origin/feature/map
     )
     val_transform = ClipTransform(image_size=image_size, train=False, gaussian_noise_std=0.0)
     return train_transform, val_transform
 
 
-def set_backbone_trainable(model: TemporalTransformerClassifier, trainable: bool) -> None:
-    for parameter in model.frame_encoder.parameters():
-        parameter.requires_grad = trainable
-
-
-def compute_class_weights(samples: Sequence[ClipSample], device: torch.device) -> torch.Tensor:
+def compute_class_weights(samples: Sequence[ImageSample], device: torch.device) -> torch.Tensor:
     counts = [0 for _ in CLASS_NAMES]
     for sample in samples:
         counts[sample.label] += 1
@@ -370,43 +349,39 @@ def compute_class_weights(samples: Sequence[ClipSample], device: torch.device) -
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    criterion: nn.Module,
-) -> Dict[str, float]:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, criterion) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
+    correct = 0
     total = 0
     true_positive = 0
     false_positive = 0
     false_negative = 0
-    correct = 0
 
     with torch.no_grad():
-        for clips, labels in loader:
-            clips = clips.to(device)
+        for images, labels in loader:
+            images = images.to(device)
             labels = labels.to(device)
-            logits = model(clips)
+            logits = model(images)
             loss = criterion(logits, labels)
+            total_loss += loss.item() * images.size(0)
 
-            total_loss += loss.item() * clips.size(0)
             predictions = logits.argmax(dim=1)
             correct += int((predictions == labels).sum().item())
             total += int(labels.size(0))
-
             true_positive += int(((predictions == 1) & (labels == 1)).sum().item())
             false_positive += int(((predictions == 1) & (labels == 0)).sum().item())
             false_negative += int(((predictions == 0) & (labels == 1)).sum().item())
 
+    if total == 0:
+        return {"loss": 0.0, "accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+
     precision = true_positive / max(true_positive + false_positive, 1)
     recall = true_positive / max(true_positive + false_negative, 1)
     f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-    accuracy = correct / max(total, 1)
     return {
-        "loss": total_loss / max(total, 1),
-        "accuracy": accuracy,
+        "loss": total_loss / total,
+        "accuracy": correct / total,
         "precision": precision,
         "recall": recall,
         "f1": f1,
@@ -426,8 +401,8 @@ def main() -> None:
     train_samples, val_samples = split_samples(samples, args.val_split, args.seed)
     train_transform, val_transform = make_transforms(args.image_size, args.gaussian_noise_std)
 
-    train_dataset = ClipDataset(train_samples, train_transform, args.frames_per_clip)
-    val_dataset = ClipDataset(val_samples, val_transform, args.frames_per_clip)
+    train_dataset = CropDataset(train_samples, train_transform)
+    val_dataset = CropDataset(val_samples, val_transform)
 
     train_loader = DataLoader(
         train_dataset,
@@ -444,15 +419,7 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    model = TemporalTransformerClassifier(
-        backbone_name=args.model_name,
-        num_classes=len(CLASS_NAMES),
-        transformer_dim=args.transformer_dim,
-        num_heads=args.transformer_heads,
-        num_layers=args.transformer_layers,
-        dropout=args.dropout,
-    ).to(device)
-
+    model = build_model(args.model_name).to(device)
     class_weights = compute_class_weights(train_samples, device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.AdamW(
@@ -460,10 +427,9 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    best_model_path = args.output_dir / "best_distracted_transformer.pt"
+    best_model_path = args.output_dir / "best_distracted_classifier.pt"
     metadata_path = args.output_dir / "training_metadata.json"
 
     best_val_f1 = -1.0
@@ -472,33 +438,28 @@ def main() -> None:
     history: List[Dict[str, float]] = []
 
     print(f"Device: {device}")
-    print(f"Train clips: {len(train_samples)} | Val clips: {len(val_samples)}")
+    print(f"Train samples: {len(train_samples)} | Val samples: {len(val_samples)}")
 
     for epoch in range(1, args.epochs + 1):
-        train_backbone = epoch > args.freeze_backbone_epochs
-        set_backbone_trainable(model, train_backbone)
         model.train()
-
         running_loss = 0.0
         seen = 0
         correct = 0
 
-        for clips, labels in train_loader:
-            clips = clips.to(device)
+        for images, labels in train_loader:
+            images = images.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(clips)
+            logits = model(images)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item() * clips.size(0)
+            running_loss += loss.item() * images.size(0)
             predictions = logits.argmax(dim=1)
             correct += int((predictions == labels).sum().item())
             seen += int(labels.size(0))
-
-        scheduler.step()
 
         train_loss = running_loss / max(seen, 1)
         train_accuracy = correct / max(seen, 1)
@@ -513,8 +474,6 @@ def main() -> None:
             "val_precision": round(val_metrics["precision"], 4),
             "val_recall": round(val_metrics["recall"], 4),
             "val_f1": round(val_metrics["f1"], 4),
-            "lr": round(float(optimizer.param_groups[0]["lr"]), 8),
-            "backbone_trainable": train_backbone,
         }
         history.append(epoch_metrics)
         print(epoch_metrics)
@@ -529,11 +488,6 @@ def main() -> None:
                     "state_dict": model.state_dict(),
                     "class_names": CLASS_NAMES,
                     "image_size": args.image_size,
-                    "frames_per_clip": args.frames_per_clip,
-                    "transformer_dim": args.transformer_dim,
-                    "transformer_heads": args.transformer_heads,
-                    "transformer_layers": args.transformer_layers,
-                    "dropout": args.dropout,
                 },
                 best_model_path,
             )
@@ -553,16 +507,16 @@ def main() -> None:
         "model_name": args.model_name,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
-        "frames_per_clip": args.frames_per_clip,
         "image_size": args.image_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "val_split": args.val_split,
-        "train_clips": len(train_samples),
-        "val_clips": len(val_samples),
+        "train_samples": len(train_samples),
+        "val_samples": len(val_samples),
         "best_val_f1": round(float(best_val_f1), 4),
         "best_epoch": best_epoch,
         "class_names": CLASS_NAMES,
+<<<<<<< HEAD
         "transformer_dim": args.transformer_dim,
         "transformer_heads": args.transformer_heads,
         "transformer_layers": args.transformer_layers,
@@ -570,6 +524,8 @@ def main() -> None:
         "freeze_backbone_epochs": args.freeze_backbone_epochs,
         "gaussian_noise_std": args.gaussian_noise_std,
         "early_stopping_patience": args.early_stopping_patience,
+=======
+>>>>>>> origin/feature/map
         "history": history,
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")

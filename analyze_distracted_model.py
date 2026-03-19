@@ -2,7 +2,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
 import cv2
 import numpy as np
@@ -12,34 +12,32 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from train_distracted_classifier import (
-    CLASS_NAMES,
-    ClipDataset,
-    TemporalTransformerClassifier,
+    CropDataset,
+    build_model,
     collect_labeled_samples,
-    load_clip_frames,
     split_samples,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze a distracted/focused Transformer model: metrics, confusion matrix, and error galleries."
+        description="Analyze a distracted/focused image classifier: metrics, confusion matrix, and error galleries."
     )
     parser.add_argument("--dataset-root", type=Path, default=Path("datasets/distracted_classifier/labeled"))
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("models/distracted_classifier/best_distracted_transformer.pt"),
+        default=Path("models/distracted_classifier/best_distracted_classifier.pt"),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/distracted_analysis"))
     parser.add_argument("--split", choices=["val", "train", "all"], default="val")
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-errors-per-type", type=int, default=50)
-    parser.add_argument("--max-visualizations-per-type", type=int, default=8)
+    parser.add_argument("--max-visualizations-per-type", type=int, default=16)
     return parser.parse_args()
 
 
@@ -65,23 +63,14 @@ def load_model_bundle(checkpoint_path: Path, device: torch.device):
         checkpoint = torch.load(checkpoint_path, weights_only=True, **load_kwargs)
     except TypeError:
         checkpoint = torch.load(checkpoint_path, **load_kwargs)
-    model = TemporalTransformerClassifier(
-        backbone_name=checkpoint["model_name"],
-        num_classes=len(checkpoint["class_names"]),
-        transformer_dim=checkpoint["transformer_dim"],
-        num_heads=checkpoint["transformer_heads"],
-        num_layers=checkpoint["transformer_layers"],
-        dropout=checkpoint.get("dropout", 0.1),
-    )
+    model = build_model(checkpoint["model_name"])
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
     model.eval()
     return {
         "model": model,
         "class_names": checkpoint["class_names"],
-        "frames_per_clip": checkpoint["frames_per_clip"],
         "image_size": checkpoint["image_size"],
-        "checkpoint": checkpoint,
     }
 
 
@@ -98,14 +87,13 @@ def select_samples(args: argparse.Namespace):
 def build_predictions(
     samples,
     transform,
-    frames_per_clip: int,
     model,
     class_names: Sequence[str],
     device: torch.device,
     batch_size: int,
     workers: int,
 ) -> List[Dict[str, object]]:
-    dataset = ClipDataset(samples, transform, frames_per_clip)
+    dataset = CropDataset(samples, transform)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -117,21 +105,21 @@ def build_predictions(
     rows: List[Dict[str, object]] = []
     sample_index = 0
     with torch.no_grad():
-        for clips, labels in loader:
-            clips = clips.to(device)
+        for images, labels in loader:
+            images = images.to(device)
             labels = labels.to(device)
-            logits = model(clips)
+            logits = model(images)
             probabilities = torch.softmax(logits, dim=1)
             confidences, predictions = probabilities.max(dim=1)
 
-            batch_size_actual = clips.size(0)
+            batch_size_actual = images.size(0)
             for idx in range(batch_size_actual):
                 sample = samples[sample_index]
                 true_idx = int(labels[idx].item())
                 pred_idx = int(predictions[idx].item())
                 prob_row = probabilities[idx].detach().cpu().numpy().tolist()
                 row = {
-                    "clip_path": str(sample.path),
+                    "image_path": str(sample.path),
                     "group_key": sample.group_key,
                     "true_label": class_names[true_idx],
                     "pred_label": class_names[pred_idx],
@@ -189,28 +177,10 @@ def save_confusion_matrix_artifacts(
 
     max_value = max(int(matrix.max()), 1)
     for row_idx, true_name in enumerate(class_names):
-        cv2.putText(
-            image,
-            true_name,
-            (20, margin + row_idx * cell_size + cell_size // 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (20, 20, 20),
-            2,
-            cv2.LINE_AA,
-        )
+        cv2.putText(image, true_name, (20, margin + row_idx * cell_size + cell_size // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 2, cv2.LINE_AA)
         for col_idx, pred_name in enumerate(class_names):
             if row_idx == 0:
-                cv2.putText(
-                    image,
-                    pred_name,
-                    (margin + col_idx * cell_size + 15, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (20, 20, 20),
-                    2,
-                    cv2.LINE_AA,
-                )
+                cv2.putText(image, pred_name, (margin + col_idx * cell_size + 15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 2, cv2.LINE_AA)
             value = int(matrix[row_idx, col_idx])
             intensity = int(255 - (value / max_value) * 190)
             color = (255, intensity, intensity) if row_idx != col_idx else (intensity, 255, intensity)
@@ -220,16 +190,7 @@ def save_confusion_matrix_artifacts(
             y2 = y1 + cell_size
             cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness=-1)
             cv2.rectangle(image, (x1, y1), (x2, y2), (80, 80, 80), thickness=2)
-            cv2.putText(
-                image,
-                str(value),
-                (x1 + 60, y1 + 100),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.2,
-                (20, 20, 20),
-                2,
-                cv2.LINE_AA,
-            )
+            cv2.putText(image, str(value), (x1 + 60, y1 + 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (20, 20, 20), 2, cv2.LINE_AA)
 
     cv2.imwrite(str(output_dir / "confusion_matrix.png"), image)
 
@@ -245,214 +206,29 @@ def save_predictions_csv(rows: Sequence[Dict[str, object]], output_path: Path) -
         writer.writerows(rows)
 
 
-def denormalize_tensor(image_tensor: torch.Tensor) -> np.ndarray:
-    mean = torch.tensor([0.485, 0.456, 0.406], dtype=image_tensor.dtype, device=image_tensor.device).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], dtype=image_tensor.dtype, device=image_tensor.device).view(3, 1, 1)
-    image = image_tensor * std + mean
-    image = image.clamp(0.0, 1.0).permute(1, 2, 0).detach().cpu().numpy()
-    return (image * 255.0).astype(np.uint8)
-
-
-def make_heat_overlay(image_bgr: np.ndarray, heatmap: np.ndarray) -> np.ndarray:
-    heat_uint8 = np.clip(heatmap * 255.0, 0, 255).astype(np.uint8)
-    heat_colormap = cv2.applyColorMap(heat_uint8, cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(image_bgr, 0.45, heat_colormap, 0.55, 0.0)
-    return overlay
-
-
-def draw_temporal_importance_chart(
-    frame_scores: np.ndarray,
-    width: int,
-    height: int,
-) -> np.ndarray:
-    canvas = np.full((height, width, 3), 245, dtype=np.uint8)
-    if frame_scores.size == 0:
-        return canvas
-
-    max_score = max(float(frame_scores.max()), 1e-8)
-    num_frames = len(frame_scores)
-    chart_left = 40
-    chart_right = width - 20
-    chart_top = 20
-    chart_bottom = height - 40
-    chart_width = chart_right - chart_left
-    bar_width = max(chart_width // max(num_frames, 1), 8)
-
-    cv2.line(canvas, (chart_left, chart_bottom), (chart_right, chart_bottom), (80, 80, 80), 2)
-    cv2.line(canvas, (chart_left, chart_bottom), (chart_left, chart_top), (80, 80, 80), 2)
-
-    for idx, score in enumerate(frame_scores):
-        norm_score = float(score) / max_score
-        x1 = chart_left + idx * bar_width
-        x2 = min(x1 + bar_width - 2, chart_right)
-        y1 = int(chart_bottom - norm_score * (chart_bottom - chart_top))
-        cv2.rectangle(canvas, (x1, y1), (x2, chart_bottom - 1), (70, 130, 255), thickness=-1)
-        cv2.putText(
-            canvas,
-            str(idx),
-            (x1, chart_bottom + 18),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            (20, 20, 20),
-            1,
-            cv2.LINE_AA,
-        )
-
-    cv2.putText(
-        canvas,
-        "Temporal importance by frame",
-        (chart_left, 14),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (20, 20, 20),
-        1,
-        cv2.LINE_AA,
-    )
-    return canvas
-
-
-def explain_clip_prediction(
-    bundle,
-    clip_path: Path,
-    device: torch.device,
-) -> Tuple[np.ndarray, str]:
-    transform = build_transform(bundle["image_size"])
-    raw_frames = load_clip_frames(clip_path, bundle["frames_per_clip"])
-    frame_tensors = [transform(frame) for frame in raw_frames]
-    clip_tensor = torch.stack(frame_tensors, dim=0).unsqueeze(0).to(device)
-    clip_tensor.requires_grad_(True)
-
-    model = bundle["model"]
-    model.zero_grad(set_to_none=True)
-    logits = model(clip_tensor)
-    probabilities = torch.softmax(logits, dim=1)
-    pred_idx = int(probabilities.argmax(dim=1).item())
-    pred_label = bundle["class_names"][pred_idx]
-    confidence = float(probabilities[0, pred_idx].item())
-
-    target_logit = logits[0, pred_idx]
-    target_logit.backward()
-    gradients = clip_tensor.grad.detach()[0]
-    saliency = gradients.abs().mean(dim=1).cpu().numpy()
-    frame_scores = saliency.reshape(saliency.shape[0], -1).mean(axis=1)
-
-    if float(frame_scores.max()) > 0:
-        frame_scores = frame_scores / float(frame_scores.max())
-
-    if saliency.max() > 0:
-        saliency = saliency / saliency.max()
-
-    selected_indices = np.linspace(0, len(raw_frames) - 1, min(4, len(raw_frames)), dtype=int)
-    panel_width = 240
-    top_chart = draw_temporal_importance_chart(frame_scores, width=panel_width * len(selected_indices), height=140)
-
-    top_row = []
-    bottom_row = []
-    for frame_idx in selected_indices:
-        image_rgb = denormalize_tensor(clip_tensor.detach()[0, frame_idx])
-        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-        image_bgr = cv2.resize(image_bgr, (panel_width, panel_width), interpolation=cv2.INTER_LINEAR)
-
-        heat = cv2.resize(saliency[frame_idx], (panel_width, panel_width), interpolation=cv2.INTER_LINEAR)
-        overlay = make_heat_overlay(image_bgr, heat)
-
-        top_panel = image_bgr.copy()
-        bottom_panel = overlay.copy()
-        cv2.putText(
-            top_panel,
-            f"frame {int(frame_idx)}",
-            (10, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            bottom_panel,
-            f"importance {frame_scores[frame_idx]:.2f}",
-            (10, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        top_row.append(top_panel)
-        bottom_row.append(bottom_panel)
-
-    header = np.full((86, panel_width * len(selected_indices), 3), 250, dtype=np.uint8)
-    cv2.putText(
-        header,
-        f"pred={pred_label} conf={confidence:.3f}",
-        (12, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (20, 20, 20),
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        header,
-        clip_path.name,
-        (12, 58),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (20, 20, 20),
-        1,
-        cv2.LINE_AA,
-    )
-
-    montage = np.vstack([header, top_chart, np.hstack(top_row), np.hstack(bottom_row)])
-    return montage, pred_label
-
-
-def make_clip_preview(clip_path: Path, title_lines: Sequence[str], output_path: Path) -> None:
-    frames = load_clip_frames(clip_path, frames_per_clip=3)
-    preview_frames = []
-    for image in frames:
-        frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        preview_frames.append(cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR))
-
-    strip = np.hstack(preview_frames)
-    canvas = np.full((300, strip.shape[1], 3), 245, dtype=np.uint8)
-    canvas[76 : 76 + strip.shape[0], :, :] = strip
+def make_image_preview(image_path: Path, title_lines: Sequence[str], output_path: Path) -> None:
+    image = Image.open(image_path).convert("RGB")
+    preview = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    preview = cv2.resize(preview, (224, 224), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((320, 320, 3), 245, dtype=np.uint8)
+    canvas[90:314, 48:272] = preview
     y = 28
     for line in title_lines:
-        cv2.putText(
-            canvas,
-            line,
-            (12, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (20, 20, 20),
-            2,
-            cv2.LINE_AA,
-        )
-        y += 24
+        cv2.putText(canvas, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
+        y += 22
     cv2.imwrite(str(output_path), canvas)
 
 
 def save_visual_explanations(
     rows: Sequence[Dict[str, object]],
-    bundle,
     output_dir: Path,
-    device: torch.device,
     max_visualizations_per_type: int,
 ) -> None:
     groups = {
-        "false_positives": [
-            row for row in rows if row["true_label"] == "focused" and row["pred_label"] == "distracted"
-        ],
-        "false_negatives": [
-            row for row in rows if row["true_label"] == "distracted" and row["pred_label"] == "focused"
-        ],
-        "true_positives": [
-            row for row in rows if row["true_label"] == "distracted" and row["pred_label"] == "distracted"
-        ],
-        "true_negatives": [
-            row for row in rows if row["true_label"] == "focused" and row["pred_label"] == "focused"
-        ],
+        "false_positives": [row for row in rows if row["true_label"] == "focused" and row["pred_label"] == "distracted"],
+        "false_negatives": [row for row in rows if row["true_label"] == "distracted" and row["pred_label"] == "focused"],
+        "true_positives": [row for row in rows if row["true_label"] == "distracted" and row["pred_label"] == "distracted"],
+        "true_negatives": [row for row in rows if row["true_label"] == "focused" and row["pred_label"] == "focused"],
     }
 
     visual_root = output_dir / "visual_explanations"
@@ -464,13 +240,16 @@ def save_visual_explanations(
         manifest_rows = []
         sorted_rows = sorted(group_rows, key=lambda item: float(item["confidence"]), reverse=True)
         for index, row in enumerate(sorted_rows[:max_visualizations_per_type], start=1):
-            clip_path = Path(str(row["clip_path"]))
-            montage, _ = explain_clip_prediction(bundle, clip_path, device)
-            image_name = f"{index:03d}_{clip_path.stem}.jpg"
-            image_path = group_dir / image_name
-            cv2.imwrite(str(image_path), montage)
+            image_path = Path(str(row["image_path"]))
+            output_path = group_dir / f"{index:03d}_{image_path.stem}.jpg"
+            title_lines = [
+                f"pred={row['pred_label']} conf={float(row['confidence']):.3f}",
+                f"true={row['true_label']}",
+                image_path.name,
+            ]
+            make_image_preview(image_path, title_lines, output_path)
             manifest_row = dict(row)
-            manifest_row["visualization_path"] = str(image_path)
+            manifest_row["visualization_path"] = str(output_path)
             manifest_rows.append(manifest_row)
         save_predictions_csv(manifest_rows, group_dir / "manifest.csv")
 
@@ -480,30 +259,23 @@ def save_error_gallery(
     output_dir: Path,
     max_errors_per_type: int,
 ) -> None:
-    false_positives = [
-        row for row in rows if row["true_label"] == "focused" and row["pred_label"] == "distracted"
-    ]
-    false_negatives = [
-        row for row in rows if row["true_label"] == "distracted" and row["pred_label"] == "focused"
-    ]
+    false_positives = [row for row in rows if row["true_label"] == "focused" and row["pred_label"] == "distracted"]
+    false_negatives = [row for row in rows if row["true_label"] == "distracted" and row["pred_label"] == "focused"]
 
-    for error_name, error_rows in {
-        "false_positives": false_positives,
-        "false_negatives": false_negatives,
-    }.items():
+    for error_name, error_rows in {"false_positives": false_positives, "false_negatives": false_negatives}.items():
         error_dir = output_dir / error_name
         error_dir.mkdir(parents=True, exist_ok=True)
         sorted_rows = sorted(error_rows, key=lambda item: float(item["confidence"]), reverse=True)
         manifest_rows = []
         for index, row in enumerate(sorted_rows[:max_errors_per_type], start=1):
-            clip_path = Path(str(row["clip_path"]))
-            preview_name = f"{index:03d}_{clip_path.stem}.jpg"
+            image_path = Path(str(row["image_path"]))
+            preview_name = f"{index:03d}_{image_path.stem}.jpg"
             title_lines = [
                 f"{error_name[:-1]} #{index}",
                 f"true={row['true_label']} pred={row['pred_label']} conf={float(row['confidence']):.3f}",
-                clip_path.name,
+                image_path.name,
             ]
-            make_clip_preview(clip_path, title_lines, error_dir / preview_name)
+            make_image_preview(image_path, title_lines, error_dir / preview_name)
             manifest_rows.append(row)
         save_predictions_csv(manifest_rows, error_dir / "manifest.csv")
 
@@ -524,16 +296,9 @@ def save_summary(
         "seed": args.seed,
         "sample_count": sample_count,
         "class_names": bundle["class_names"],
-        "frames_per_clip": bundle["frames_per_clip"],
         "image_size": bundle["image_size"],
         "metrics": {key: round(float(value), 4) for key, value in metrics.items()},
         "confusion_matrix": confusion_matrix.tolist(),
-        "visual_outputs": {
-            "confusion_matrix_png": str(output_path.parent / "confusion_matrix.png"),
-            "false_positives_dir": str(output_path.parent / "false_positives"),
-            "false_negatives_dir": str(output_path.parent / "false_negatives"),
-            "visual_explanations_dir": str(output_path.parent / "visual_explanations"),
-        },
     }
     output_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -549,7 +314,6 @@ def main() -> None:
     rows = build_predictions(
         samples=samples,
         transform=transform,
-        frames_per_clip=bundle["frames_per_clip"],
         model=bundle["model"],
         class_names=bundle["class_names"],
         device=device,
@@ -562,13 +326,7 @@ def main() -> None:
     save_predictions_csv(rows, args.output_dir / "predictions.csv")
     save_confusion_matrix_artifacts(matrix, bundle["class_names"], args.output_dir)
     save_error_gallery(rows, args.output_dir, args.max_errors_per_type)
-    save_visual_explanations(
-        rows,
-        bundle,
-        args.output_dir,
-        device,
-        args.max_visualizations_per_type,
-    )
+    save_visual_explanations(rows, args.output_dir, args.max_visualizations_per_type)
     save_summary(args, bundle, len(rows), metrics, matrix, args.output_dir / "summary.json")
 
     print(f"Device: {device}")

@@ -41,11 +41,11 @@ LABEL_TASKS = {
         ],
     },
     "distracted": {
-        "title": "Distracted Clip Labeler (focused / distracted)",
+        "title": "Distracted Crop Labeler (focused / distracted)",
         "source_dir": Path("datasets/distracted_classifier/unlabeled"),
         "labeled_dir": Path("datasets/distracted_classifier/labeled"),
         "progress_file": Path("datasets/distracted_classifier/label_progress.csv"),
-        "media_type": "video",
+        "media_type": "image",
         "labels": [
             {"name": "focused",    "key": "f", "display": "F=focused",    "color": "#4ec9b0"},
             {"name": "distracted", "key": "d", "display": "D=distracted", "color": "#dcdcaa"},
