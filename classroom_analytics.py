@@ -36,6 +36,8 @@ CROWDING_PROXIMITY_PX = 120
 CROWDING_MIN_DURATION_SEC = 2.0
 CROWDING_SEATED_MAX_MOVEMENT_PX = 25.0
 CROWDING_APPROACH_MOVEMENT_PX = 35.0
+FIGHT_PARTICIPANT_PROXIMITY_PX = 140.0
+FIGHT_PARTICIPANT_MOVEMENT_PX = 45.0
 
 POSE_SIT = "sit"
 POSE_STAND = "stand"
@@ -80,6 +82,8 @@ class DetectionState:
     crowding: bool = False
     crowding_ids: str = ""
     crowding_duration_sec: float = 0.0
+    fight_detected: bool = False
+    fight_ids: str = ""
 
 
 @dataclass
@@ -142,6 +146,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--behavior-threshold", type=float, default=0.65)
     parser.add_argument("--fight-classifier", type=Path, default=None, help="Path to trained fight / non-fight video classifier checkpoint.")
     parser.add_argument("--fight-threshold", type=float, default=0.75)
+    parser.add_argument("--fight-participant-proximity-px", type=float, default=FIGHT_PARTICIPANT_PROXIMITY_PX,
+                        help="Max center distance (px) to localise likely fight participants.")
+    parser.add_argument("--fight-participant-movement-px", type=float, default=FIGHT_PARTICIPANT_MOVEMENT_PX,
+                        help="Min movement (px) to treat a nearby student as actively involved in a fight.")
     parser.add_argument("--red-box-min-duration-sec", type=float, default=RED_BOX_MIN_DURATION_SEC)
     parser.add_argument(
         "--device",
@@ -689,6 +697,45 @@ def is_fight_label(label: Optional[str]) -> bool:
     return label.strip().lower() not in NON_FIGHT_LABELS
 
 
+def localize_fight_participants(
+    states: Dict[int, DetectionState],
+    proximity_px: float,
+    movement_px: float,
+) -> Dict[int, List[int]]:
+    if len(states) < 2:
+        return {}
+
+    def is_aggressive(state: DetectionState) -> bool:
+        movement_value = state.movement_px or 0.0
+        return bool(
+            state.rapid_motion
+            or movement_value >= movement_px
+            or state.horseplay
+            or (state.crowding and state.pose != POSE_SIT)
+            or (state.pose == POSE_STAND and movement_value >= movement_px * 0.6)
+        )
+
+    aggressive_ids = {person_id for person_id, state in states.items() if is_aggressive(state)}
+    if len(aggressive_ids) < 2:
+        return {}
+
+    participant_map: Dict[int, set[int]] = {}
+    state_items = list(states.items())
+    for idx, (person_a, state_a) in enumerate(state_items):
+        if person_a not in aggressive_ids:
+            continue
+        for person_b, state_b in state_items[idx + 1:]:
+            if person_b not in aggressive_ids:
+                continue
+            dist = float(np.hypot(state_a.center[0] - state_b.center[0], state_a.center[1] - state_b.center[1]))
+            if dist > proximity_px:
+                continue
+            participant_map.setdefault(person_a, set()).add(person_b)
+            participant_map.setdefault(person_b, set()).add(person_a)
+
+    return {person_id: sorted(partners) for person_id, partners in participant_map.items()}
+
+
 def classify_crop_with_model(
     frame: np.ndarray,
     bbox_xyxy: np.ndarray,
@@ -1011,6 +1058,8 @@ def annotate_frame(
                 lines.append(f"red {state.red_box_duration_sec:.1f}s")
             if state.crowding:
                 lines.append(f"crowding {state.crowding_duration_sec:.1f}s")
+            if state.fight_detected:
+                lines.append("fight")
         if state.horseplay:
             lines.append(f"!! horseplay {state.horseplay_score:.1f}")
         elif state.violation_type:
@@ -1413,6 +1462,8 @@ def results_to_states(
             crowding=crowding_flag,
             crowding_ids=crowding_ids_str,
             crowding_duration_sec=round(crowding_duration_sec, 3),
+            fight_detected=False,
+            fight_ids="",
             horseplay_score=safe_float(horseplay_score) if hp_enabled else None,
             horseplay=horseplay_flag,
             proximity_ids=proximity_ids_str,
@@ -1438,6 +1489,8 @@ def results_to_states(
                 "crowding": crowding_flag,
                 "crowding_ids": crowding_ids_str,
                 "crowding_duration_sec": round(crowding_duration_sec, 3),
+                "fight_detected": False,
+                "fight_ids": "",
                 "bbox_x1": state.bbox[0],
                 "bbox_y1": state.bbox[1],
                 "bbox_x2": state.bbox[2],
@@ -2075,15 +2128,30 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                             clip_state=fight_clip_state,
                         )
                         last_fight_active = is_fight_label(last_fight_label)
-                        if last_fight_active:
-                            for state in last_states.values():
+                        fight_participants = (
+                            localize_fight_participants(
+                                states=last_states,
+                                proximity_px=args.fight_participant_proximity_px,
+                                movement_px=args.fight_participant_movement_px,
+                            )
+                            if last_fight_active
+                            else {}
+                        )
+                        for person_id, state in last_states.items():
+                            partner_ids = fight_participants.get(person_id, [])
+                            state.fight_detected = len(partner_ids) > 0
+                            state.fight_ids = ",".join(str(pid) for pid in partner_ids)
+                            if state.fight_detected:
                                 state.violation_type = append_violation(state.violation_type, "fight")
 
                     for row in frame_rows:
                         row["fight_label"] = last_fight_label
                         row["fight_confidence"] = safe_float(last_fight_confidence)
-                        row["fight_detected"] = last_fight_active
-                        if last_fight_active:
+                        person_id = int(row["person_id"])
+                        state = last_states.get(person_id)
+                        row["fight_detected"] = bool(state.fight_detected) if state is not None else False
+                        row["fight_ids"] = state.fight_ids if state is not None else ""
+                        if bool(row["fight_detected"]):
                             row["violation_type"] = append_violation(str(row.get("violation_type", "")), "fight")
                 report_rows.extend(frame_rows)
                 update_live_report_stats(
@@ -2176,6 +2244,7 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                 "fight_label",
                 "fight_confidence",
                 "fight_detected",
+                "fight_ids",
                 "movement_px",
                 "rapid_motion",
                 "crowding",
