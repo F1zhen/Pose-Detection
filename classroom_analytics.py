@@ -32,6 +32,10 @@ HORSEPLAY_BURST_WINDOW_SEC = 4.0
 HORSEPLAY_BURST_MIN = 3
 HORSEPLAY_SCORE_THRESHOLD = 2.0
 HORSEPLAY_STANDING_WEIGHT = 0.5
+CROWDING_PROXIMITY_PX = 120
+CROWDING_MIN_DURATION_SEC = 2.0
+CROWDING_SEATED_MAX_MOVEMENT_PX = 25.0
+CROWDING_APPROACH_MOVEMENT_PX = 35.0
 
 POSE_SIT = "sit"
 POSE_STAND = "stand"
@@ -73,6 +77,9 @@ class DetectionState:
     proximity_ids: str = ""
     oscillation_count: int = 0
     burst_count: int = 0
+    crowding: bool = False
+    crowding_ids: str = ""
+    crowding_duration_sec: float = 0.0
 
 
 @dataclass
@@ -98,12 +105,14 @@ class LiveReportStats:
     unknown_frames: int = 0
     rapid_motion_frames: int = 0
     horseplay_frames: int = 0
+    crowding_frames: int = 0
     current_people: int = 0
     current_sit: int = 0
     current_stand: int = 0
     current_unknown: int = 0
     current_rapid_motion: int = 0
     current_horseplay: int = 0
+    current_crowding: int = 0
     current_red_boxes: int = 0
     fight_frames: int = 0
     current_fight: bool = False
@@ -190,6 +199,16 @@ def parse_args() -> argparse.Namespace:
                         help="Score weight for standing-while-close component.")
     parser.add_argument("--disable-horseplay", action="store_true",
                         help="Disable horseplay analysis entirely.")
+    parser.add_argument("--crowding-proximity-px", type=float, default=CROWDING_PROXIMITY_PX,
+                        help="Max center distance (px) to consider students crowded together.")
+    parser.add_argument("--crowding-min-duration-sec", type=float, default=CROWDING_MIN_DURATION_SEC,
+                        help="Min duration (sec) of close contact before crowding is confirmed.")
+    parser.add_argument("--crowding-seated-max-movement-px", type=float, default=CROWDING_SEATED_MAX_MOVEMENT_PX,
+                        help="If both students are seated and move less than this, ignore as same-desk seating.")
+    parser.add_argument("--crowding-approach-movement-px", type=float, default=CROWDING_APPROACH_MOVEMENT_PX,
+                        help="Movement threshold (px) to treat close interaction as meaningful approach.")
+    parser.add_argument("--disable-crowding", action="store_true",
+                        help="Disable crowding / approach analysis entirely.")
     return parser.parse_args()
 
 
@@ -366,6 +385,28 @@ class RedBoxTracker:
 
         start_time = self.active_start_times.setdefault(person_id, timestamp_sec)
         return max(0.0, timestamp_sec - start_time)
+
+
+class PairDurationTracker:
+    def __init__(self) -> None:
+        self.active_start_times: Dict[Tuple[int, int], float] = {}
+
+    @staticmethod
+    def normalise_pair(person_a: int, person_b: int) -> Tuple[int, int]:
+        return (person_a, person_b) if person_a < person_b else (person_b, person_a)
+
+    def update(self, pair_key: Tuple[int, int], is_active: bool, timestamp_sec: float) -> float:
+        if not is_active:
+            self.active_start_times.pop(pair_key, None)
+            return 0.0
+
+        start_time = self.active_start_times.setdefault(pair_key, timestamp_sec)
+        return max(0.0, timestamp_sec - start_time)
+
+    def retain_only(self, active_pair_keys: set[Tuple[int, int]]) -> None:
+        stale_keys = [pair_key for pair_key in self.active_start_times if pair_key not in active_pair_keys]
+        for pair_key in stale_keys:
+            self.active_start_times.pop(pair_key, None)
 
 
 class PositionalEncoding:
@@ -841,6 +882,8 @@ def update_live_report_stats(
 
             if bool(row.get("rapid_motion", False)):
                 live_stats.rapid_motion_frames += 1
+            if bool(row.get("crowding", False)):
+                live_stats.crowding_frames += 1
             if bool(row.get("horseplay", False)):
                 live_stats.horseplay_frames += 1
             if bool(row.get("fight_detected", False)):
@@ -854,6 +897,7 @@ def update_live_report_stats(
     live_stats.current_stand = sum(1 for state in states.values() if state.pose == POSE_STAND)
     live_stats.current_unknown = sum(1 for state in states.values() if state.pose == POSE_UNKNOWN)
     live_stats.current_rapid_motion = sum(1 for state in states.values() if state.rapid_motion)
+    live_stats.current_crowding = sum(1 for state in states.values() if state.crowding)
     live_stats.current_horseplay = sum(1 for state in states.values() if state.horseplay)
     live_stats.current_red_boxes = sum(1 for state in states.values() if state.red_box_confirmed)
     live_stats.current_fight = any("fight" in str(state.violation_type).lower() for state in states.values())
@@ -876,6 +920,7 @@ def draw_live_report_panel(
         lines.extend(
             [
                 f"now sit={live_stats.current_sit} stand={live_stats.current_stand} unk={live_stats.current_unknown}",
+                f"crowding={live_stats.current_crowding}",
                 f"red boxes 3s={live_stats.current_red_boxes}",
                 f"fight={'yes' if live_stats.current_fight else 'no'}",
             ]
@@ -946,7 +991,7 @@ def annotate_frame(
             state.pose,
             state.violation_type,
             is_horseplay=state.horseplay,
-            is_red_box=state.red_box,
+            is_red_box=state.red_box_confirmed,
         )
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness=2)
 
@@ -964,6 +1009,8 @@ def annotate_frame(
                 lines.append(behavior_line)
             if state.red_box_confirmed:
                 lines.append(f"red {state.red_box_duration_sec:.1f}s")
+            if state.crowding:
+                lines.append(f"crowding {state.crowding_duration_sec:.1f}s")
         if state.horseplay:
             lines.append(f"!! horseplay {state.horseplay_score:.1f}")
         elif state.violation_type:
@@ -1075,6 +1122,7 @@ def results_to_states(
     behavior_classifier_bundle,
     behavior_clip_states: Optional[Dict[int, TrackClipState]] = None,
     red_box_tracker: Optional["RedBoxTracker"] = None,
+    crowding_tracker: Optional["PairDurationTracker"] = None,
     horseplay_tracker: Optional["HorseplayTracker"] = None,
 ) -> Tuple[Dict[int, DetectionState], List[Dict[str, object]]]:
     states: Dict[int, DetectionState] = {}
@@ -1149,7 +1197,7 @@ def results_to_states(
             else 0.0
         )
         red_box_confirmed = red_box and red_box_duration_sec >= args.red_box_min_duration_sec
-        if red_box:
+        if red_box_confirmed:
             violation_type = append_violation(
                 violation_type,
                 normalized_behavior_label or "behavior",
@@ -1183,10 +1231,16 @@ def results_to_states(
         and horseplay_tracker is not None
         and not getattr(args, "disable_horseplay", False)
     )
+    crowding_enabled = (
+        args.mode == "analyze"
+        and crowding_tracker is not None
+        and not getattr(args, "disable_crowding", False)
+    )
     person_ids_list = list(_person_data.keys())
 
     # Pre-compute pairwise proximity
     proximity_map: Dict[int, List[int]] = {pid: [] for pid in person_ids_list}
+    crowding_candidate_pairs: set[Tuple[int, int]] = set()
     if hp_enabled:
         for i, pid_a in enumerate(person_ids_list):
             ca = _person_data[pid_a]["center"]
@@ -1196,6 +1250,71 @@ def results_to_states(
                 if dist < args.horseplay_proximity_px:
                     proximity_map[pid_a].append(pid_b)
                     proximity_map[pid_b].append(pid_a)
+    if crowding_enabled:
+        for i, pid_a in enumerate(person_ids_list):
+            da = _person_data[pid_a]
+            ca = da["center"]
+            for pid_b in person_ids_list[i + 1:]:
+                db = _person_data[pid_b]
+                cb = db["center"]
+                dist = float(np.hypot(ca[0] - cb[0], ca[1] - cb[1]))
+                if dist >= args.crowding_proximity_px:
+                    continue
+
+                movement_a = safe_float(da["movement_px"]) or 0.0
+                movement_b = safe_float(db["movement_px"]) or 0.0
+                both_seated_and_still = (
+                    da["pose"] == POSE_SIT
+                    and db["pose"] == POSE_SIT
+                    and movement_a <= args.crowding_seated_max_movement_px
+                    and movement_b <= args.crowding_seated_max_movement_px
+                )
+                meaningful_approach = (
+                    da["pose"] != POSE_SIT
+                    or db["pose"] != POSE_SIT
+                    or da["rapid_motion"]
+                    or db["rapid_motion"]
+                    or movement_a >= args.crowding_approach_movement_px
+                    or movement_b >= args.crowding_approach_movement_px
+                )
+                if both_seated_and_still or not meaningful_approach:
+                    continue
+
+                crowding_candidate_pairs.add(PairDurationTracker.normalise_pair(pid_a, pid_b))
+
+    pair_durations: Dict[Tuple[int, int], float] = {}
+    confirmed_crowding_pairs: set[Tuple[int, int]] = set()
+    confirmed_crowding_groups: List[set[int]] = []
+    if crowding_enabled and crowding_tracker is not None:
+        for pair_key in crowding_candidate_pairs:
+            pair_durations[pair_key] = crowding_tracker.update(pair_key, True, timestamp_sec)
+        crowding_tracker.retain_only(crowding_candidate_pairs)
+        confirmed_crowding_pairs = {
+            pair_key
+            for pair_key, duration_sec in pair_durations.items()
+            if duration_sec >= args.crowding_min_duration_sec
+        }
+        if confirmed_crowding_pairs:
+            adjacency: Dict[int, set[int]] = {}
+            for person_a, person_b in confirmed_crowding_pairs:
+                adjacency.setdefault(person_a, set()).add(person_b)
+                adjacency.setdefault(person_b, set()).add(person_a)
+
+            visited: set[int] = set()
+            for person_id in adjacency:
+                if person_id in visited:
+                    continue
+                stack = [person_id]
+                component: set[int] = set()
+                while stack:
+                    current = stack.pop()
+                    if current in visited:
+                        continue
+                    visited.add(current)
+                    component.add(current)
+                    stack.extend(adjacency.get(current, set()) - visited)
+                if len(component) >= 3:
+                    confirmed_crowding_groups.append(component)
 
     for person_id in person_ids_list:
         d = _person_data[person_id]
@@ -1203,9 +1322,26 @@ def results_to_states(
 
         horseplay_score = 0.0
         horseplay_flag = False
+        crowding_flag = False
+        crowding_ids_str = ""
+        crowding_duration_sec = 0.0
         proximity_ids_str = ""
         oscillation_count = 0
         burst_count = 0
+
+        if crowding_enabled:
+            crowding_partners: List[int] = []
+            for group in confirmed_crowding_groups:
+                if person_id not in group:
+                    continue
+                crowding_partners.extend(pid for pid in group if pid != person_id)
+                for pair_key in confirmed_crowding_pairs:
+                    if pair_key[0] in group and pair_key[1] in group:
+                        crowding_duration_sec = max(crowding_duration_sec, pair_durations.get(pair_key, 0.0))
+            crowding_flag = len(crowding_partners) > 0
+            crowding_ids_str = ",".join(str(pid) for pid in sorted(set(crowding_partners)))
+            if crowding_flag:
+                violation_type = append_violation(violation_type, "crowding")
 
         if hp_enabled:
             ht = horseplay_tracker
@@ -1274,6 +1410,9 @@ def results_to_states(
             red_box=d["red_box"],
             red_box_duration_sec=safe_float(d["red_box_duration_sec"]) or 0.0,
             red_box_confirmed=d["red_box_confirmed"],
+            crowding=crowding_flag,
+            crowding_ids=crowding_ids_str,
+            crowding_duration_sec=round(crowding_duration_sec, 3),
             horseplay_score=safe_float(horseplay_score) if hp_enabled else None,
             horseplay=horseplay_flag,
             proximity_ids=proximity_ids_str,
@@ -1296,6 +1435,9 @@ def results_to_states(
                 "behavior_confidence": safe_float(d["behavior_confidence"]),
                 "movement_px": safe_float(d["movement_px"]),
                 "rapid_motion": d["rapid_motion"],
+                "crowding": crowding_flag,
+                "crowding_ids": crowding_ids_str,
+                "crowding_duration_sec": round(crowding_duration_sec, 3),
                 "bbox_x1": state.bbox[0],
                 "bbox_y1": state.bbox[1],
                 "bbox_x2": state.bbox[2],
@@ -1477,6 +1619,103 @@ def build_events(state_df: pd.DataFrame, min_event_duration_sec: float) -> pd.Da
                     }
                 )
 
+    if "red_box_confirmed" in ordered.columns:
+        for person_id, group in ordered.groupby("person_id", sort=False):
+            rows = group.reset_index(drop=True)
+            start_idx = None
+            for idx, row in rows.iterrows():
+                is_distracted = bool(row.get("red_box_confirmed", False))
+                if is_distracted and start_idx is None:
+                    start_idx = idx
+                if not is_distracted and start_idx is not None:
+                    start_row = rows.iloc[start_idx]
+                    end_row = rows.iloc[idx - 1]
+                    duration_sec = float(end_row["timestamp_sec"] - start_row["timestamp_sec"])
+                    if duration_sec >= min_event_duration_sec or idx - start_idx >= 1:
+                        events.append(
+                            {
+                                "person_id": int(person_id),
+                                "event_type": "distracted_interval",
+                                "start_timestamp": start_row["timestamp"],
+                                "end_timestamp": end_row["timestamp"],
+                                "start_frame": int(start_row["frame"]),
+                                "end_frame": int(end_row["frame"]),
+                                "duration_sec": round(max(duration_sec, 0.0), 3),
+                                "num_observations": int(idx - start_idx),
+                            }
+                        )
+                    start_idx = None
+
+            if start_idx is not None:
+                start_row = rows.iloc[start_idx]
+                end_row = rows.iloc[len(rows) - 1]
+                duration_sec = float(end_row["timestamp_sec"] - start_row["timestamp_sec"])
+                if duration_sec >= min_event_duration_sec or len(rows) - start_idx >= 1:
+                    events.append(
+                        {
+                            "person_id": int(person_id),
+                            "event_type": "distracted_interval",
+                            "start_timestamp": start_row["timestamp"],
+                            "end_timestamp": end_row["timestamp"],
+                            "start_frame": int(start_row["frame"]),
+                            "end_frame": int(end_row["frame"]),
+                            "duration_sec": round(max(duration_sec, 0.0), 3),
+                            "num_observations": int(len(rows) - start_idx),
+                        }
+                    )
+
+    if "crowding" in ordered.columns:
+        for person_id, group in ordered.groupby("person_id", sort=False):
+            rows = group.reset_index(drop=True)
+            start_idx = None
+            partner_ids = ""
+            for idx, row in rows.iterrows():
+                is_crowding = bool(row.get("crowding", False))
+                if is_crowding and start_idx is None:
+                    start_idx = idx
+                    partner_ids = str(row.get("crowding_ids", "") or "")
+                elif is_crowding and start_idx is not None and not partner_ids:
+                    partner_ids = str(row.get("crowding_ids", "") or "")
+                if not is_crowding and start_idx is not None:
+                    start_row = rows.iloc[start_idx]
+                    end_row = rows.iloc[idx - 1]
+                    duration_sec = float(end_row["timestamp_sec"] - start_row["timestamp_sec"])
+                    if duration_sec >= min_event_duration_sec or idx - start_idx >= 1:
+                        events.append(
+                            {
+                                "person_id": int(person_id),
+                                "event_type": "crowding_interval",
+                                "start_timestamp": start_row["timestamp"],
+                                "end_timestamp": end_row["timestamp"],
+                                "start_frame": int(start_row["frame"]),
+                                "end_frame": int(end_row["frame"]),
+                                "duration_sec": round(max(duration_sec, 0.0), 3),
+                                "num_observations": int(idx - start_idx),
+                                "partner_ids": partner_ids,
+                            }
+                        )
+                    start_idx = None
+                    partner_ids = ""
+
+            if start_idx is not None:
+                start_row = rows.iloc[start_idx]
+                end_row = rows.iloc[len(rows) - 1]
+                duration_sec = float(end_row["timestamp_sec"] - start_row["timestamp_sec"])
+                if duration_sec >= min_event_duration_sec or len(rows) - start_idx >= 1:
+                    events.append(
+                        {
+                            "person_id": int(person_id),
+                            "event_type": "crowding_interval",
+                            "start_timestamp": start_row["timestamp"],
+                            "end_timestamp": end_row["timestamp"],
+                            "start_frame": int(start_row["frame"]),
+                            "end_frame": int(end_row["frame"]),
+                            "duration_sec": round(max(duration_sec, 0.0), 3),
+                            "num_observations": int(len(rows) - start_idx),
+                            "partner_ids": partner_ids,
+                        }
+                    )
+
     if "fight_detected" in ordered.columns:
         for person_id, group in ordered.groupby("person_id", sort=False):
             rows = group.reset_index(drop=True)
@@ -1542,10 +1781,14 @@ def build_summary(
             "pose_stand_frames": 0,
             "pose_unknown_frames": 0,
             "rapid_motion_frames": 0,
+            "distracted_frames": 0,
+            "crowding_frames": 0,
             "fight_frames": 0,
             "horseplay_frames": 0,
             "standing_intervals": 0,
             "rapid_motion_intervals": 0,
+            "distracted_intervals": 0,
+            "crowding_intervals": 0,
             "fight_intervals": 0,
             "horseplay_intervals": 0,
             "standing_too_long_intervals": 0,
@@ -1561,6 +1804,8 @@ def build_summary(
 
     pose_counts = state_df["stable_pose"].value_counts(dropna=False).to_dict()
     rapid_motion_frames = int(state_df["rapid_motion"].fillna(False).astype(bool).sum()) if "rapid_motion" in state_df.columns else 0
+    distracted_frames = int(state_df["red_box_confirmed"].fillna(False).astype(bool).sum()) if "red_box_confirmed" in state_df.columns else 0
+    crowding_frames = int(state_df["crowding"].fillna(False).astype(bool).sum()) if "crowding" in state_df.columns else 0
     fight_frames = int(state_df["fight_detected"].fillna(False).astype(bool).sum()) if "fight_detected" in state_df.columns else 0
     horseplay_frames = int(state_df["horseplay"].fillna(False).astype(bool).sum()) if "horseplay" in state_df.columns else 0
 
@@ -1579,10 +1824,14 @@ def build_summary(
         "pose_stand_frames": int(pose_counts.get(POSE_STAND, 0)),
         "pose_unknown_frames": int(pose_counts.get(POSE_UNKNOWN, 0)),
         "rapid_motion_frames": rapid_motion_frames,
+        "distracted_frames": distracted_frames,
+        "crowding_frames": crowding_frames,
         "fight_frames": fight_frames,
         "horseplay_frames": horseplay_frames,
         "standing_intervals": count_events("standing_interval"),
         "rapid_motion_intervals": count_events("rapid_motion_interval"),
+        "distracted_intervals": count_events("distracted_interval"),
+        "crowding_intervals": count_events("crowding_interval"),
         "fight_intervals": count_events("fight_interval"),
         "horseplay_intervals": count_events("horseplay_interval"),
         "standing_too_long_intervals": count_events("standing_too_long"),
@@ -1602,10 +1851,14 @@ def build_summary(
                 "stand_frames": int(person_pose_counts.get(POSE_STAND, 0)),
                 "unknown_frames": int(person_pose_counts.get(POSE_UNKNOWN, 0)),
                 "rapid_motion_frames": int(group["rapid_motion"].fillna(False).astype(bool).sum()) if "rapid_motion" in group.columns else 0,
+                "distracted_frames": int(group["red_box_confirmed"].fillna(False).astype(bool).sum()) if "red_box_confirmed" in group.columns else 0,
+                "crowding_frames": int(group["crowding"].fillna(False).astype(bool).sum()) if "crowding" in group.columns else 0,
                 "fight_frames": int(group["fight_detected"].fillna(False).astype(bool).sum()) if "fight_detected" in group.columns else 0,
                 "horseplay_frames": int(group["horseplay"].fillna(False).astype(bool).sum()) if "horseplay" in group.columns else 0,
                 "standing_intervals": int((person_events["event_type"] == "standing_interval").sum()) if not person_events.empty else 0,
                 "rapid_motion_intervals": int((person_events["event_type"] == "rapid_motion_interval").sum()) if not person_events.empty else 0,
+                "distracted_intervals": int((person_events["event_type"] == "distracted_interval").sum()) if not person_events.empty else 0,
+                "crowding_intervals": int((person_events["event_type"] == "crowding_interval").sum()) if not person_events.empty else 0,
                 "fight_intervals": int((person_events["event_type"] == "fight_interval").sum()) if not person_events.empty else 0,
                 "horseplay_intervals": int((person_events["event_type"] == "horseplay_interval").sum()) if not person_events.empty else 0,
             }
@@ -1621,10 +1874,14 @@ def build_summary(
         f"Stand frames: {summary_row['pose_stand_frames']}",
         f"Unknown frames: {summary_row['pose_unknown_frames']}",
         f"Rapid-motion frames: {summary_row['rapid_motion_frames']}",
+        f"Distracted frames (3s+): {summary_row['distracted_frames']}",
+        f"Crowding frames: {summary_row['crowding_frames']}",
         f"Fight frames: {summary_row['fight_frames']}",
         f"Horseplay frames: {summary_row['horseplay_frames']}",
         f"Standing intervals: {summary_row['standing_intervals']}",
         f"Rapid-motion intervals: {summary_row['rapid_motion_intervals']}",
+        f"Distracted intervals: {summary_row['distracted_intervals']}",
+        f"Crowding intervals: {summary_row['crowding_intervals']}",
         f"Fight intervals: {summary_row['fight_intervals']}",
         f"Horseplay intervals: {summary_row['horseplay_intervals']}",
         f"Standing-too-long intervals: {summary_row['standing_too_long_intervals']}",
@@ -1635,7 +1892,9 @@ def build_summary(
         text_lines.append(
             f"ID {row['person_id']}: frames={row['frames']}, "
             f"sit={row['sit_frames']}, stand={row['stand_frames']}, unknown={row['unknown_frames']}, "
-            f"rapid_motion={row['rapid_motion_frames']}, fight={row['fight_frames']}, horseplay={row['horseplay_frames']}"
+            f"rapid_motion={row['rapid_motion_frames']}, distracted={row['distracted_frames']}, "
+            f"crowding={row['crowding_frames']}, "
+            f"fight={row['fight_frames']}, horseplay={row['horseplay_frames']}"
         )
 
     return pd.DataFrame([summary_row]), per_person_rows, "\n".join(text_lines) + "\n"
@@ -1754,6 +2013,7 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     last_states: Dict[int, DetectionState] = {}
     live_stats = LiveReportStats()
     red_box_tracker = None if args.count_only else RedBoxTracker()
+    crowding_tracker = None if args.count_only else PairDurationTracker()
     horseplay_tracker = None if args.count_only else HorseplayTracker()
     last_fight_label: Optional[str] = None
     last_fight_confidence: Optional[float] = None
@@ -1803,6 +2063,7 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                         behavior_classifier_bundle=behavior_classifier_bundle,
                         behavior_clip_states=behavior_clip_states,
                         red_box_tracker=red_box_tracker,
+                        crowding_tracker=crowding_tracker,
                         horseplay_tracker=horseplay_tracker,
                     )
 
@@ -1917,6 +2178,9 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                 "fight_detected",
                 "movement_px",
                 "rapid_motion",
+                "crowding",
+                "crowding_ids",
+                "crowding_duration_sec",
                 "bbox_x1",
                 "bbox_y1",
                 "bbox_x2",
