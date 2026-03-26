@@ -1,5 +1,9 @@
 import argparse
 import json
+import shutil
+import subprocess
+import tempfile
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -38,6 +42,13 @@ CROWDING_SEATED_MAX_MOVEMENT_PX = 25.0
 CROWDING_APPROACH_MOVEMENT_PX = 35.0
 FIGHT_PARTICIPANT_PROXIMITY_PX = 140.0
 FIGHT_PARTICIPANT_MOVEMENT_PX = 45.0
+SOUND_WINDOW_SEC = 1.0
+SOUND_THRESHOLD = 0.75
+SOUND_NEGATIVE_LABEL = "background"
+SOUND_POSITIVE_LABEL = "gunshot_or_explosion"
+TEACHER_MIN_BOX_HEIGHT_PX = 140.0
+TEACHER_ENTER_SEC = 1.0
+TEACHER_EXIT_SEC = 3.0
 
 POSE_SIT = "sit"
 POSE_STAND = "stand"
@@ -54,6 +65,10 @@ COLOR_UNKNOWN = (180, 180, 180)
 COLOR_VIOLATION = (0, 0, 255)
 COLOR_TEXT_BG = (25, 25, 25)
 COLOR_HORSEPLAY = (0, 200, 255)
+COLOR_SOUND_ALERT = (0, 70, 255)
+COLOR_TEACHER = (255, 220, 0)
+COLOR_TEACHER_ROI = (255, 170, 0)
+COLOR_TEACHER_DESK_ROI = (255, 255, 0)
 
 
 @dataclass
@@ -84,6 +99,8 @@ class DetectionState:
     crowding_duration_sec: float = 0.0
     fight_detected: bool = False
     fight_ids: str = ""
+    is_teacher: bool = False
+    teacher_zone: str = ""
 
 
 @dataclass
@@ -98,6 +115,22 @@ class GlobalClipState:
     frames: List[np.ndarray]
     last_label: Optional[str] = None
     last_confidence: Optional[float] = None
+
+
+@dataclass
+class SoundWindow:
+    start_sec: float
+    end_sec: float
+    label: Optional[str]
+    confidence: Optional[float]
+    alert: bool
+
+
+@dataclass
+class TeacherStatus:
+    present: bool = False
+    track_id: Optional[int] = None
+    zone: str = ""
 
 
 @dataclass
@@ -120,6 +153,10 @@ class LiveReportStats:
     current_red_boxes: int = 0
     fight_frames: int = 0
     current_fight: bool = False
+    sound_alert_frames: int = 0
+    current_sound_alert: bool = False
+    current_teacher_present: bool = False
+    current_teacher_track_id: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.unique_people is None:
@@ -146,6 +183,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--behavior-threshold", type=float, default=0.65)
     parser.add_argument("--fight-classifier", type=Path, default=None, help="Path to trained fight / non-fight video classifier checkpoint.")
     parser.add_argument("--fight-threshold", type=float, default=0.75)
+    parser.add_argument("--sound-classifier", type=Path, default=None, help="Path to audio classifier checkpoint for gunshot / explosion sounds.")
+    parser.add_argument("--sound-threshold", type=float, default=SOUND_THRESHOLD)
+    parser.add_argument("--sound-window-sec", type=float, default=SOUND_WINDOW_SEC,
+                        help="Audio analysis window size in seconds for the sound classifier.")
+    parser.add_argument("--ffmpeg-bin", default="ffmpeg", help="Path to ffmpeg executable used to extract audio.")
+    parser.add_argument("--teacher-board-roi", default="",
+                        help="Teacher board ROI polygon. Format: x1,y1;x2,y2;... Use 0..1 normalized coords or pixels.")
+    parser.add_argument("--teacher-desk-roi", default="",
+                        help="Teacher desk ROI polygon. Format: x1,y1;x2,y2;... Use 0..1 normalized coords or pixels.")
+    parser.add_argument("--teacher-min-box-height-px", type=float, default=TEACHER_MIN_BOX_HEIGHT_PX,
+                        help="Min bbox height in pixels for teacher candidate filtering.")
+    parser.add_argument("--teacher-enter-sec", type=float, default=TEACHER_ENTER_SEC,
+                        help="Required time inside teacher ROI before teacher_present becomes true.")
+    parser.add_argument("--teacher-exit-sec", type=float, default=TEACHER_EXIT_SEC,
+                        help="Allowed time without teacher candidate before teacher_present becomes false.")
     parser.add_argument("--fight-participant-proximity-px", type=float, default=FIGHT_PARTICIPANT_PROXIMITY_PX,
                         help="Max center distance (px) to localise likely fight participants.")
     parser.add_argument("--fight-participant-movement-px", type=float, default=FIGHT_PARTICIPANT_MOVEMENT_PX,
@@ -250,6 +302,7 @@ def build_output_paths(output_dir: Path, video_path: Path, mode: str) -> Dict[st
     return {
         "run_dir": run_dir,
         "video": run_dir / f"{stem}_{mode}_annotated.mp4",
+        "video_silent": run_dir / f"{stem}_{mode}_annotated_silent.mp4",
         "xlsx": run_dir / f"{stem}_{mode}_report.xlsx",
     }
 
@@ -297,6 +350,85 @@ def compute_person_center(bbox_xyxy: np.ndarray) -> Tuple[float, float]:
 def get_bbox_tuple(bbox_xyxy: np.ndarray) -> Tuple[int, int, int, int]:
     x1, y1, x2, y2 = bbox_xyxy.tolist()
     return (int(x1), int(y1), int(x2), int(y2))
+
+
+def get_bbox_bottom_center(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
+    x1, _, x2, y2 = bbox
+    return ((x1 + x2) / 2.0, float(y2))
+
+
+def get_bbox_height(bbox: Tuple[int, int, int, int]) -> float:
+    return float(max(0, bbox[3] - bbox[1]))
+
+
+def parse_roi_polygon_spec(spec: str, frame_width: int, frame_height: int) -> Optional[np.ndarray]:
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+
+    tokens = [token.strip() for token in spec.replace("|", ";").split(";") if token.strip()]
+    points: List[Tuple[float, float]] = []
+    for token in tokens:
+        values = [value.strip() for value in token.split(",")]
+        if len(values) != 2:
+            raise ValueError(
+                f"Invalid ROI point '{token}'. Expected format x,y;x,y;..."
+            )
+        try:
+            x_value = float(values[0])
+            y_value = float(values[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid ROI coordinate '{token}'. Expected numeric x,y values."
+            ) from exc
+        points.append((x_value, y_value))
+
+    if len(points) < 3:
+        raise ValueError("ROI polygon must contain at least 3 points.")
+
+    use_normalized = all(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for x, y in points)
+    scaled_points = []
+    for x_value, y_value in points:
+        if use_normalized:
+            scaled_x = int(round(x_value * frame_width))
+            scaled_y = int(round(y_value * frame_height))
+        else:
+            scaled_x = int(round(x_value))
+            scaled_y = int(round(y_value))
+        scaled_points.append(
+            (
+                min(max(scaled_x, 0), max(frame_width - 1, 0)),
+                min(max(scaled_y, 0), max(frame_height - 1, 0)),
+            )
+        )
+
+    return np.array(scaled_points, dtype=np.int32)
+
+
+def point_inside_polygon(point: Tuple[float, float], polygon: Optional[np.ndarray]) -> bool:
+    if polygon is None or len(polygon) < 3:
+        return False
+    return cv2.pointPolygonTest(polygon.astype(np.float32), point, False) >= 0
+
+
+def draw_roi_polygon(frame: np.ndarray, polygon: Optional[np.ndarray], color: Tuple[int, int, int], label: str) -> None:
+    if polygon is None or len(polygon) < 3:
+        return
+    contour = polygon.reshape((-1, 1, 2))
+    cv2.polylines(frame, [contour], isClosed=True, color=color, thickness=2)
+    anchor_x = int(np.min(polygon[:, 0]))
+    anchor_y = int(np.min(polygon[:, 1]))
+    text_origin = (max(10, anchor_x), max(18, anchor_y - 6))
+    cv2.putText(
+        frame,
+        label,
+        text_origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def expand_bbox(
@@ -415,6 +547,116 @@ class PairDurationTracker:
         stale_keys = [pair_key for pair_key in self.active_start_times if pair_key not in active_pair_keys]
         for pair_key in stale_keys:
             self.active_start_times.pop(pair_key, None)
+
+
+class TeacherTracker:
+    def __init__(self, enter_sec: float, exit_sec: float) -> None:
+        self.enter_sec = max(enter_sec, 0.0)
+        self.exit_sec = max(exit_sec, 0.0)
+        self.roi_dwell_sec: Dict[int, float] = {}
+        self.pending_track_id: Optional[int] = None
+        self.pending_since_sec: Optional[float] = None
+        self.current_teacher_id: Optional[int] = None
+        self.current_teacher_zone: str = ""
+        self.teacher_present: bool = False
+        self.absence_since_sec: Optional[float] = None
+        self.last_timestamp_sec: Optional[float] = None
+
+    def update(
+        self,
+        states: Dict[int, DetectionState],
+        board_roi: Optional[np.ndarray],
+        desk_roi: Optional[np.ndarray],
+        min_box_height_px: float,
+        timestamp_sec: float,
+    ) -> TeacherStatus:
+        if board_roi is None and desk_roi is None:
+            self.teacher_present = False
+            self.current_teacher_id = None
+            self.current_teacher_zone = ""
+            self.pending_track_id = None
+            self.pending_since_sec = None
+            self.absence_since_sec = None
+            self.last_timestamp_sec = timestamp_sec
+            return TeacherStatus()
+
+        delta_sec = 0.0
+        if self.last_timestamp_sec is not None:
+            delta_sec = max(0.0, timestamp_sec - self.last_timestamp_sec)
+        self.last_timestamp_sec = timestamp_sec
+
+        candidates: Dict[int, Dict[str, object]] = {}
+        for person_id, state in states.items():
+            bbox = state.bbox
+            if state.pose != POSE_STAND:
+                continue
+            if get_bbox_height(bbox) < min_box_height_px:
+                continue
+
+            foot_point = get_bbox_bottom_center(bbox)
+            in_board = point_inside_polygon(foot_point, board_roi)
+            in_desk = point_inside_polygon(foot_point, desk_roi)
+            if not in_board and not in_desk:
+                continue
+
+            zone = "board" if in_board else "desk"
+            self.roi_dwell_sec[person_id] = self.roi_dwell_sec.get(person_id, 0.0) + delta_sec
+            candidates[person_id] = {
+                "zone": zone,
+                "dwell_sec": self.roi_dwell_sec.get(person_id, 0.0),
+            }
+
+        best_track_id: Optional[int] = None
+        best_zone = ""
+        if candidates:
+            def rank(item: Tuple[int, Dict[str, object]]) -> Tuple[float, int, int]:
+                person_id, data = item
+                zone_priority = 1 if str(data["zone"]) == "board" else 0
+                current_priority = 1 if person_id == self.current_teacher_id else 0
+                return (float(data["dwell_sec"]), zone_priority, current_priority)
+
+            best_track_id, best_data = max(candidates.items(), key=rank)
+            best_zone = str(best_data["zone"])
+
+        if best_track_id is not None:
+            self.absence_since_sec = None
+            if self.teacher_present:
+                self.current_teacher_id = best_track_id
+                self.current_teacher_zone = best_zone
+                self.pending_track_id = None
+                self.pending_since_sec = None
+            else:
+                if self.pending_track_id != best_track_id:
+                    self.pending_track_id = best_track_id
+                    self.pending_since_sec = timestamp_sec
+                if self.pending_since_sec is None:
+                    self.pending_since_sec = timestamp_sec
+                if timestamp_sec - self.pending_since_sec >= self.enter_sec:
+                    self.teacher_present = True
+                    self.current_teacher_id = best_track_id
+                    self.current_teacher_zone = best_zone
+                    self.pending_track_id = None
+                    self.pending_since_sec = None
+        else:
+            self.pending_track_id = None
+            self.pending_since_sec = None
+            if self.teacher_present:
+                if self.absence_since_sec is None:
+                    self.absence_since_sec = timestamp_sec
+                if timestamp_sec - self.absence_since_sec >= self.exit_sec:
+                    self.teacher_present = False
+                    self.current_teacher_id = None
+                    self.current_teacher_zone = ""
+                    self.absence_since_sec = None
+            else:
+                self.current_teacher_id = None
+                self.current_teacher_zone = ""
+
+        return TeacherStatus(
+            present=self.teacher_present,
+            track_id=self.current_teacher_id,
+            zone=self.current_teacher_zone,
+        )
 
 
 class PositionalEncoding:
@@ -630,6 +872,231 @@ def load_fight_classifier_bundle(classifier_path: Optional[Path], device, torch_
         "image_size": image_size,
         "num_frames": num_frames,
     }
+
+
+def build_sound_classifier_model(input_dim: int, hidden_dim: int, num_classes: int, dropout: float) -> nn.Module:
+    return nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, num_classes),
+    )
+
+
+def load_sound_classifier_bundle(classifier_path: Optional[Path], device, torch_module):
+    if classifier_path is None:
+        return None
+
+    load_kwargs = {"map_location": device}
+    try:
+        checkpoint = torch_module.load(classifier_path, weights_only=True, **load_kwargs)
+    except TypeError:
+        checkpoint = torch_module.load(classifier_path, **load_kwargs)
+
+    input_dim = int(checkpoint["input_dim"])
+    hidden_dim = int(checkpoint["hidden_dim"])
+    num_classes = int(checkpoint["num_classes"])
+    dropout = float(checkpoint.get("dropout", 0.0))
+    class_names = checkpoint.get("class_names")
+    if class_names is None:
+        if num_classes == 2:
+            class_names = [SOUND_NEGATIVE_LABEL, SOUND_POSITIVE_LABEL]
+        else:
+            class_names = [f"class_{index}" for index in range(num_classes)]
+
+    model = build_sound_classifier_model(input_dim, hidden_dim, num_classes, dropout)
+    state_dict = checkpoint["state_dict"]
+    if any(key.startswith("network.") for key in state_dict):
+        state_dict = {key.replace("network.", "", 1): value for key, value in state_dict.items()}
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    return {
+        "kind": "sound",
+        "model": model,
+        "torch": torch_module,
+        "input_dim": input_dim,
+        "class_names": [str(name) for name in class_names],
+        "negative_index": 0,
+    }
+
+
+def extract_audio_to_wav(video_path: Path, wav_path: Path, ffmpeg_bin: str) -> None:
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:a:0?",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-sample_fmt",
+        "s16",
+        str(wav_path),
+    ]
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "ffmpeg was not found. Install ffmpeg or pass --ffmpeg-bin with the executable path."
+        ) from exc
+
+    if completed.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size == 0:
+        stderr = completed.stderr.strip()
+        raise RuntimeError(
+            f"ffmpeg failed while extracting audio from {video_path}.\n{stderr}"
+        )
+
+
+def mux_original_audio(video_without_audio: Path, source_video: Path, output_path: Path, ffmpeg_bin: str) -> None:
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        str(video_without_audio),
+        "-i",
+        str(source_video),
+        "-c:v",
+        "copy",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-c:a",
+        "aac",
+        "-shortest",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed while muxing audio into {output_path}.\n{completed.stderr.strip()}"
+        )
+
+
+def load_wav_audio_signal(wav_path: Path) -> Tuple[np.ndarray, int]:
+    with wave.open(str(wav_path), "rb") as wav_file:
+        sample_rate = wav_file.getframerate()
+        sample_width = wav_file.getsampwidth()
+        channels = wav_file.getnchannels()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if sample_width != 2:
+        raise RuntimeError(f"Only 16-bit PCM WAV is supported, got sample width {sample_width}.")
+
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    if audio.size == 0:
+        return np.zeros(0, dtype=np.float32), sample_rate
+    return audio / float(np.iinfo(np.int16).max), sample_rate
+
+
+def build_sound_feature_vector(audio_chunk: np.ndarray, input_dim: int) -> np.ndarray:
+    if input_dim < 2:
+        raise ValueError(f"Sound classifier input_dim must be >= 2, got {input_dim}")
+
+    n_fft = (input_dim - 1) * 2
+    hop_length = max(n_fft // 2, 1)
+    if audio_chunk.size == 0:
+        return np.zeros(input_dim, dtype=np.float32)
+
+    if audio_chunk.size < n_fft:
+        padded = np.pad(audio_chunk, (0, n_fft - audio_chunk.size))
+        frames = padded.reshape(1, n_fft)
+    else:
+        windows: List[np.ndarray] = []
+        max_start = audio_chunk.size - n_fft
+        for start in range(0, max_start + 1, hop_length):
+            windows.append(audio_chunk[start : start + n_fft])
+        if max_start > 0 and max_start % hop_length != 0:
+            windows.append(audio_chunk[-n_fft:])
+        frames = np.stack(windows, axis=0)
+
+    hann = np.hanning(n_fft).astype(np.float32)
+    spectrum = np.abs(np.fft.rfft(frames * hann[None, :], axis=1)).astype(np.float32)
+    feature = np.log1p(spectrum).mean(axis=0)
+    norm = float(np.linalg.norm(feature))
+    if norm > 1e-6:
+        feature = feature / norm
+    return feature[:input_dim].astype(np.float32, copy=False)
+
+
+def load_sound_windows_with_model(
+    video_path: Path,
+    classifier_bundle,
+    window_sec: float,
+    threshold: float,
+    ffmpeg_bin: str,
+) -> List[SoundWindow]:
+    if classifier_bundle is None:
+        return []
+
+    ffmpeg_path = shutil.which(ffmpeg_bin) or ffmpeg_bin
+    analysis_window_sec = max(window_sec, 0.1)
+    samples_per_window = 0
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        wav_path = Path(temp_dir) / "audio.wav"
+        extract_audio_to_wav(video_path, wav_path, ffmpeg_path)
+        audio, sample_rate = load_wav_audio_signal(wav_path)
+        samples_per_window = max(1, int(round(analysis_window_sec * sample_rate)))
+
+    if audio.size == 0:
+        return []
+
+    windows: List[SoundWindow] = []
+    alert_class_indices = set(range(len(classifier_bundle["class_names"]))) - {int(classifier_bundle["negative_index"])}
+    device = next(classifier_bundle["model"].parameters()).device
+    for start_index in range(0, audio.size, samples_per_window):
+        chunk = audio[start_index : start_index + samples_per_window]
+        if chunk.size == 0:
+            continue
+
+        feature = build_sound_feature_vector(chunk, classifier_bundle["input_dim"])
+        tensor = classifier_bundle["torch"].from_numpy(feature).unsqueeze(0).to(device)
+        with classifier_bundle["torch"].no_grad():
+            logits = classifier_bundle["model"](tensor)
+            probabilities = classifier_bundle["torch"].softmax(logits, dim=1)[0]
+            confidence, index = probabilities.max(dim=0)
+
+        predicted_index = int(index.item())
+        confidence_value = float(confidence.item())
+        start_sec = start_index / sample_rate
+        end_sec = min((start_index + chunk.size) / sample_rate, audio.size / sample_rate)
+        windows.append(
+            SoundWindow(
+                start_sec=start_sec,
+                end_sec=end_sec,
+                label=str(classifier_bundle["class_names"][predicted_index]),
+                confidence=confidence_value,
+                alert=predicted_index in alert_class_indices and confidence_value >= threshold,
+            )
+        )
+
+    return windows
+
+
+def get_active_sound_window(windows: List[SoundWindow], cursor: int, timestamp_sec: float) -> Tuple[Optional[SoundWindow], int]:
+    if not windows:
+        return None, 0
+
+    index = min(max(cursor, 0), len(windows) - 1)
+    while index + 1 < len(windows) and timestamp_sec >= windows[index].end_sec:
+        index += 1
+
+    current = windows[index]
+    if current.start_sec <= timestamp_sec < current.end_sec:
+        return current, index
+    return None, index
 
 
 def update_global_clip_state(
@@ -867,6 +1334,7 @@ def select_box_color(
     violation_type: str,
     is_horseplay: bool = False,
     is_red_box: bool = False,
+    is_teacher: bool = False,
 ) -> Tuple[int, int, int]:
     if is_red_box:
         return COLOR_VIOLATION
@@ -874,6 +1342,8 @@ def select_box_color(
         return COLOR_HORSEPLAY
     if violation_type:
         return COLOR_VIOLATION
+    if is_teacher:
+        return COLOR_TEACHER
     if pose == POSE_SIT:
         return COLOR_SIT
     if pose == POSE_STAND:
@@ -908,6 +1378,9 @@ def update_live_report_stats(
     frame_rows: List[Dict[str, object]],
     states: Dict[int, DetectionState],
     count_only: bool,
+    sound_alert: bool = False,
+    teacher_present: bool = False,
+    teacher_track_id: Optional[int] = None,
 ) -> None:
     if frame_rows:
         live_stats.analyzed_frames += 1
@@ -935,8 +1408,13 @@ def update_live_report_stats(
                 live_stats.horseplay_frames += 1
             if bool(row.get("fight_detected", False)):
                 live_stats.fight_frames += 1
+        if sound_alert:
+            live_stats.sound_alert_frames += 1
 # текущее число людей на экране.
     live_stats.current_people = len(states)
+    live_stats.current_sound_alert = sound_alert
+    live_stats.current_teacher_present = teacher_present
+    live_stats.current_teacher_track_id = teacher_track_id
     if count_only:
         return
 
@@ -970,6 +1448,8 @@ def draw_live_report_panel(
                 f"crowding={live_stats.current_crowding}",
                 f"red boxes 3s={live_stats.current_red_boxes}",
                 f"fight={'yes' if live_stats.current_fight else 'no'}",
+                f"teacher={'yes' if live_stats.current_teacher_present else 'no'} id={live_stats.current_teacher_track_id if live_stats.current_teacher_track_id is not None else '-'}",
+                f"sound_alert={'yes' if live_stats.current_sound_alert else 'no'} total={live_stats.sound_alert_frames}",
             ]
         )
 
@@ -1011,8 +1491,19 @@ def annotate_frame(
     fight_label: Optional[str] = None,
     fight_confidence: Optional[float] = None,
     fight_active: bool = False,
+    teacher_present: bool = False,
+    teacher_track_id: Optional[int] = None,
+    teacher_zone: str = "",
+    teacher_board_roi: Optional[np.ndarray] = None,
+    teacher_desk_roi: Optional[np.ndarray] = None,
+    sound_label: Optional[str] = None,
+    sound_confidence: Optional[float] = None,
+    sound_active: bool = False,
 ) -> np.ndarray:
     annotated = frame.copy()
+
+    draw_roi_polygon(annotated, teacher_board_roi, COLOR_TEACHER_ROI, "teacher_board_roi")
+    draw_roi_polygon(annotated, teacher_desk_roi, COLOR_TEACHER_DESK_ROI, "teacher_desk_roi")
 
     # Draw proximity lines between horseplay partners first (under boxes)
     for state in states.values():
@@ -1039,6 +1530,7 @@ def annotate_frame(
             state.violation_type,
             is_horseplay=state.horseplay,
             is_red_box=state.red_box_confirmed,
+            is_teacher=state.is_teacher,
         )
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness=2)
 
@@ -1060,6 +1552,8 @@ def annotate_frame(
                 lines.append(f"crowding {state.crowding_duration_sec:.1f}s")
             if state.fight_detected:
                 lines.append("fight")
+            if state.is_teacher:
+                lines.append(f"teacher {state.teacher_zone or 'roi'}")
         if state.horseplay:
             lines.append(f"!! horseplay {state.horseplay_score:.1f}")
         elif state.violation_type:
@@ -1084,6 +1578,43 @@ def annotate_frame(
             1,
             cv2.LINE_AA,
         )
+
+    if sound_label:
+        banner = f"sound={sound_label}"
+        if sound_confidence is not None:
+            banner += f" {sound_confidence:.2f}"
+        banner_color = COLOR_SOUND_ALERT if sound_active else (90, 90, 90)
+        cv2.rectangle(annotated, (10, 74), (360, 102), COLOR_TEXT_BG, thickness=-1)
+        cv2.rectangle(annotated, (10, 74), (360, 102), banner_color, thickness=1)
+        cv2.putText(
+            annotated,
+            banner,
+            (18, 94),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    teacher_banner = f"teacher={'yes' if teacher_present else 'no'}"
+    if teacher_track_id is not None:
+        teacher_banner += f" id={teacher_track_id}"
+    if teacher_zone:
+        teacher_banner += f" {teacher_zone}"
+    teacher_banner_color = COLOR_TEACHER if teacher_present else (90, 90, 90)
+    cv2.rectangle(annotated, (10, 106), (320, 134), COLOR_TEXT_BG, thickness=-1)
+    cv2.rectangle(annotated, (10, 106), (320, 134), teacher_banner_color, thickness=1)
+    cv2.putText(
+        annotated,
+        teacher_banner,
+        (18, 126),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
     timestamp_label = f"{format_timestamp(timestamp_sec)} | frame {frame_index}"
     cv2.rectangle(annotated, (10, 10), (300, 38), COLOR_TEXT_BG, thickness=-1)
@@ -1464,6 +1995,8 @@ def results_to_states(
             crowding_duration_sec=round(crowding_duration_sec, 3),
             fight_detected=False,
             fight_ids="",
+            is_teacher=False,
+            teacher_zone="",
             horseplay_score=safe_float(horseplay_score) if hp_enabled else None,
             horseplay=horseplay_flag,
             proximity_ids=proximity_ids_str,
@@ -1491,6 +2024,8 @@ def results_to_states(
                 "crowding_duration_sec": round(crowding_duration_sec, 3),
                 "fight_detected": False,
                 "fight_ids": "",
+                "is_teacher": False,
+                "teacher_zone": "",
                 "bbox_x1": state.bbox[0],
                 "bbox_y1": state.bbox[1],
                 "bbox_x2": state.bbox[2],
@@ -1817,18 +2352,126 @@ def build_events(state_df: pd.DataFrame, min_event_duration_sec: float) -> pd.Da
     return pd.DataFrame(events)
 
 
+def build_sound_events(sound_frame_df: pd.DataFrame, min_event_duration_sec: float) -> pd.DataFrame:
+    if sound_frame_df.empty or "sound_alert" not in sound_frame_df.columns:
+        return pd.DataFrame(
+            columns=[
+                "person_id",
+                "event_type",
+                "start_timestamp",
+                "end_timestamp",
+                "start_frame",
+                "end_frame",
+                "duration_sec",
+                "num_observations",
+                "label",
+                "confidence",
+            ]
+        )
+
+    ordered = sound_frame_df.sort_values("frame").reset_index(drop=True)
+    events: List[Dict[str, object]] = []
+    start_idx = None
+    peak_confidence = 0.0
+    label = ""
+
+    for idx, row in ordered.iterrows():
+        is_alert = bool(row.get("sound_alert", False))
+        if is_alert and start_idx is None:
+            start_idx = idx
+            peak_confidence = float(row.get("sound_confidence", 0.0) or 0.0)
+            label = str(row.get("sound_label", "") or "")
+        elif is_alert and start_idx is not None:
+            peak_confidence = max(peak_confidence, float(row.get("sound_confidence", 0.0) or 0.0))
+            if not label:
+                label = str(row.get("sound_label", "") or "")
+
+        if not is_alert and start_idx is not None:
+            start_row = ordered.iloc[start_idx]
+            end_row = ordered.iloc[idx - 1]
+            duration_sec = float(end_row["timestamp_sec"] - start_row["timestamp_sec"])
+            if duration_sec >= min_event_duration_sec or idx - start_idx >= 1:
+                events.append(
+                    {
+                        "person_id": None,
+                        "event_type": "sound_interval",
+                        "start_timestamp": start_row["timestamp"],
+                        "end_timestamp": end_row["timestamp"],
+                        "start_frame": int(start_row["frame"]),
+                        "end_frame": int(end_row["frame"]),
+                        "duration_sec": round(max(duration_sec, 0.0), 3),
+                        "num_observations": int(idx - start_idx),
+                        "label": label,
+                        "confidence": round(peak_confidence, 4),
+                    }
+                )
+            start_idx = None
+            peak_confidence = 0.0
+            label = ""
+
+    if start_idx is not None:
+        start_row = ordered.iloc[start_idx]
+        end_row = ordered.iloc[len(ordered) - 1]
+        duration_sec = float(end_row["timestamp_sec"] - start_row["timestamp_sec"])
+        if duration_sec >= min_event_duration_sec or len(ordered) - start_idx >= 1:
+            events.append(
+                {
+                    "person_id": None,
+                    "event_type": "sound_interval",
+                    "start_timestamp": start_row["timestamp"],
+                    "end_timestamp": end_row["timestamp"],
+                    "start_frame": int(start_row["frame"]),
+                    "end_frame": int(end_row["frame"]),
+                    "duration_sec": round(max(duration_sec, 0.0), 3),
+                    "num_observations": int(len(ordered) - start_idx),
+                    "label": label,
+                    "confidence": round(peak_confidence, 4),
+                }
+            )
+
+    return pd.DataFrame(events)
+
+
 def build_summary(
     state_df: pd.DataFrame,
     events_df: pd.DataFrame,
     video_path: Path,
     mode: str,
     total_frames_read: int,
+    sound_frame_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, object]], str]:
+    sound_frame_df = sound_frame_df if sound_frame_df is not None else pd.DataFrame()
+    sound_alert_frames = (
+        int(sound_frame_df["sound_alert"].fillna(False).astype(bool).sum())
+        if not sound_frame_df.empty and "sound_alert" in sound_frame_df.columns
+        else 0
+    )
+
+    analyzed_frames = 0
+    analysis_start = ""
+    analysis_end = ""
+    if not state_df.empty:
+        analyzed_frames = max(analyzed_frames, int(state_df["frame"].nunique()))
+        analysis_start = str(state_df["timestamp"].min())
+        analysis_end = str(state_df["timestamp"].max())
+    if not sound_frame_df.empty:
+        analyzed_frames = max(analyzed_frames, int(sound_frame_df["frame"].nunique()))
+        sound_start = str(sound_frame_df["timestamp"].min())
+        sound_end = str(sound_frame_df["timestamp"].max())
+        analysis_start = min([value for value in [analysis_start, sound_start] if value], default="")
+        analysis_end = max([value for value in [analysis_end, sound_end] if value], default="")
+
+    def count_events(event_name: str) -> int:
+        if events_df.empty or "event_type" not in events_df.columns:
+            return 0
+        return int((events_df["event_type"] == event_name).sum())
+
     if state_df.empty:
         summary_row = {
             "video_name": video_path.name,
             "mode": mode,
-            "frames_analyzed": 0,
+            "frames_analyzed": analyzed_frames,
+            "frames_read": int(total_frames_read),
             "unique_people": 0,
             "pose_sit_frames": 0,
             "pose_stand_frames": 0,
@@ -1838,20 +2481,23 @@ def build_summary(
             "crowding_frames": 0,
             "fight_frames": 0,
             "horseplay_frames": 0,
+            "sound_alert_frames": sound_alert_frames,
             "standing_intervals": 0,
             "rapid_motion_intervals": 0,
             "distracted_intervals": 0,
             "crowding_intervals": 0,
             "fight_intervals": 0,
             "horseplay_intervals": 0,
+            "sound_intervals": count_events("sound_interval") if not events_df.empty else 0,
             "standing_too_long_intervals": 0,
-            "analysis_start": "",
-            "analysis_end": "",
+            "analysis_start": analysis_start,
+            "analysis_end": analysis_end,
         }
         text = (
             f"Video: {video_path.name}\n"
             f"Mode: {mode}\n"
-            f"No detections were recorded.\n"
+            f"No person detections were recorded.\n"
+            f"Sound alert frames: {sound_alert_frames}\n"
         )
         return pd.DataFrame([summary_row]), [summary_row], text
 
@@ -1862,15 +2508,10 @@ def build_summary(
     fight_frames = int(state_df["fight_detected"].fillna(False).astype(bool).sum()) if "fight_detected" in state_df.columns else 0
     horseplay_frames = int(state_df["horseplay"].fillna(False).astype(bool).sum()) if "horseplay" in state_df.columns else 0
 
-    def count_events(event_name: str) -> int:
-        if events_df.empty or "event_type" not in events_df.columns:
-            return 0
-        return int((events_df["event_type"] == event_name).sum())
-
     summary_row = {
         "video_name": video_path.name,
         "mode": mode,
-        "frames_analyzed": int(state_df["frame"].nunique()),
+        "frames_analyzed": analyzed_frames,
         "frames_read": int(total_frames_read),
         "unique_people": int(state_df["person_id"].nunique()),
         "pose_sit_frames": int(pose_counts.get(POSE_SIT, 0)),
@@ -1881,15 +2522,17 @@ def build_summary(
         "crowding_frames": crowding_frames,
         "fight_frames": fight_frames,
         "horseplay_frames": horseplay_frames,
+        "sound_alert_frames": sound_alert_frames,
         "standing_intervals": count_events("standing_interval"),
         "rapid_motion_intervals": count_events("rapid_motion_interval"),
         "distracted_intervals": count_events("distracted_interval"),
         "crowding_intervals": count_events("crowding_interval"),
         "fight_intervals": count_events("fight_interval"),
         "horseplay_intervals": count_events("horseplay_interval"),
+        "sound_intervals": count_events("sound_interval"),
         "standing_too_long_intervals": count_events("standing_too_long"),
-        "analysis_start": str(state_df["timestamp"].min()),
-        "analysis_end": str(state_df["timestamp"].max()),
+        "analysis_start": analysis_start,
+        "analysis_end": analysis_end,
     }
 
     per_person_rows: List[Dict[str, object]] = []
@@ -1931,12 +2574,14 @@ def build_summary(
         f"Crowding frames: {summary_row['crowding_frames']}",
         f"Fight frames: {summary_row['fight_frames']}",
         f"Horseplay frames: {summary_row['horseplay_frames']}",
+        f"Sound alert frames: {summary_row['sound_alert_frames']}",
         f"Standing intervals: {summary_row['standing_intervals']}",
         f"Rapid-motion intervals: {summary_row['rapid_motion_intervals']}",
         f"Distracted intervals: {summary_row['distracted_intervals']}",
         f"Crowding intervals: {summary_row['crowding_intervals']}",
         f"Fight intervals: {summary_row['fight_intervals']}",
         f"Horseplay intervals: {summary_row['horseplay_intervals']}",
+        f"Sound intervals: {summary_row['sound_intervals']}",
         f"Standing-too-long intervals: {summary_row['standing_too_long_intervals']}",
         "",
         "Per-person summary:",
@@ -2046,6 +2691,7 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     pose_classifier_bundle = None if args.count_only else load_classifier_bundle(args.pose_classifier, torch_device, torch)
     behavior_classifier_bundle = None if args.count_only else load_classifier_bundle(args.behavior_classifier, torch_device, torch)
     fight_classifier_bundle = None if args.count_only else load_fight_classifier_bundle(args.fight_classifier, torch_device, torch)
+    sound_classifier_bundle = None if args.count_only else load_sound_classifier_bundle(args.sound_classifier, torch_device, torch)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video: {video_path}")
@@ -2054,11 +2700,23 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    sound_windows = (
+        load_sound_windows_with_model(
+            video_path=video_path,
+            classifier_bundle=sound_classifier_bundle,
+            window_sec=args.sound_window_sec,
+            threshold=args.sound_threshold,
+            ffmpeg_bin=args.ffmpeg_bin,
+        )
+        if sound_classifier_bundle is not None
+        else []
+    )
 
     output_fps = fps if args.save_every_frame else max(fps / max(args.frame_skip, 1), 1.0)
-    writer = create_video_writer(output_paths["video"], output_fps, (frame_width, frame_height))
+    writer = create_video_writer(output_paths["video_silent"], output_fps, (frame_width, frame_height))
 
     report_rows: List[Dict[str, object]] = []
+    sound_frame_rows: List[Dict[str, object]] = []
     pose_history: Dict[int, List[str]] = {}
     previous_centers: Dict[int, Tuple[float, float]] = {}
     behavior_clip_states: Dict[int, TrackClipState] = {}
@@ -2071,6 +2729,10 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
     last_fight_label: Optional[str] = None
     last_fight_confidence: Optional[float] = None
     last_fight_active = False
+    sound_window_cursor = 0
+    last_sound_label: Optional[str] = None
+    last_sound_confidence: Optional[float] = None
+    last_sound_active = False
 
     frame_index = 0
     try:
@@ -2083,6 +2745,10 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
 
             timestamp_sec = frame_index / fps if fps else 0.0
             should_process = frame_index % max(args.frame_skip, 1) == 0
+            active_sound_window, sound_window_cursor = get_active_sound_window(sound_windows, sound_window_cursor, timestamp_sec)
+            last_sound_label = active_sound_window.label if active_sound_window is not None else None
+            last_sound_confidence = active_sound_window.confidence if active_sound_window is not None else None
+            last_sound_active = bool(active_sound_window.alert) if active_sound_window is not None else False
 
             if should_process:
                 results = model.track(
@@ -2153,12 +2819,24 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                         row["fight_ids"] = state.fight_ids if state is not None else ""
                         if bool(row["fight_detected"]):
                             row["violation_type"] = append_violation(str(row.get("violation_type", "")), "fight")
+                if sound_classifier_bundle is not None:
+                    sound_frame_rows.append(
+                        {
+                            "timestamp": format_timestamp(timestamp_sec),
+                            "timestamp_sec": timestamp_sec,
+                            "frame": frame_index,
+                            "sound_label": last_sound_label,
+                            "sound_confidence": safe_float(last_sound_confidence),
+                            "sound_alert": last_sound_active,
+                        }
+                    )
                 report_rows.extend(frame_rows)
                 update_live_report_stats(
                     live_stats=live_stats,
                     frame_rows=frame_rows,
                     states=last_states,
                     count_only=args.count_only,
+                    sound_alert=last_sound_active,
                 )
 
             annotated = annotate_frame(
@@ -2172,6 +2850,9 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
                 fight_label=last_fight_label,
                 fight_confidence=last_fight_confidence,
                 fight_active=last_fight_active,
+                sound_label=last_sound_label,
+                sound_confidence=last_sound_confidence,
+                sound_active=last_sound_active,
             )
 
             if args.save_every_frame or should_process:
@@ -2189,7 +2870,24 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
         if args.show_live:
             cv2.destroyAllWindows()
 
+    silent_video_path = output_paths["video_silent"]
+    final_video_path = output_paths["video"]
+    ffmpeg_path = shutil.which(args.ffmpeg_bin) or args.ffmpeg_bin
+    if silent_video_path.exists():
+        try:
+            mux_original_audio(
+                video_without_audio=silent_video_path,
+                source_video=video_path,
+                output_path=final_video_path,
+                ffmpeg_bin=ffmpeg_path,
+            )
+            silent_video_path.unlink(missing_ok=True)
+        except (FileNotFoundError, RuntimeError) as exc:
+            silent_video_path.replace(final_video_path)
+            print(f"Warning: original audio was not preserved: {console_safe(exc)}")
+
     raw_df = pd.DataFrame(report_rows)
+    sound_frame_df = pd.DataFrame(sound_frame_rows)
     if args.count_only:
         if raw_df.empty:
             raw_df = pd.DataFrame(columns=["timestamp", "timestamp_sec", "frame", "person_id", "track_confidence", "people_in_frame"])
@@ -2272,12 +2970,16 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
         hp_events_df = _build_horseplay_events(state_df, args.min_event_duration_sec)
         if not hp_events_df.empty:
             events_df = pd.concat([events_df, hp_events_df], ignore_index=True)
+        sound_events_df = build_sound_events(sound_frame_df, args.min_event_duration_sec)
+        if not sound_events_df.empty:
+            events_df = pd.concat([events_df, sound_events_df], ignore_index=True)
         summary_df, per_person_rows, summary_text = build_summary(
             state_df=state_df,
             events_df=events_df,
             video_path=video_path,
             mode=args.mode,
             total_frames_read=frame_index,
+            sound_frame_df=sound_frame_df,
         )
         per_person_df = pd.DataFrame(per_person_rows)
 
@@ -2295,6 +2997,8 @@ def analyze_video(args: argparse.Namespace) -> Dict[str, Path]:
         print(f"Behavior classifier: {console_safe(args.behavior_classifier)}")
     if args.fight_classifier and not args.count_only:
         print(f"Fight classifier: {console_safe(args.fight_classifier)}")
+    if args.sound_classifier and not args.count_only:
+        print(f"Sound classifier: {console_safe(args.sound_classifier)}")
     print(f"Annotated video: {console_safe(output_paths['video'])}")
     print(f"Excel report: {console_safe(output_paths['xlsx'])}")
     print(summary_text.strip())

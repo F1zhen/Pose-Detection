@@ -15,6 +15,7 @@ from train_distracted_classifier import (
     CropDataset,
     build_model,
     collect_labeled_samples,
+    load_sample_image,
     split_samples,
 )
 
@@ -207,7 +208,7 @@ def save_predictions_csv(rows: Sequence[Dict[str, object]], output_path: Path) -
 
 
 def make_image_preview(image_path: Path, title_lines: Sequence[str], output_path: Path) -> None:
-    image = Image.open(image_path).convert("RGB")
+    image = load_sample_image(image_path)
     preview = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     preview = cv2.resize(preview, (224, 224), interpolation=cv2.INTER_LINEAR)
     canvas = np.full((320, 320, 3), 245, dtype=np.uint8)

@@ -11,12 +11,11 @@ from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as TF
 
 
 CLASS_NAMES = ["focused", "distracted"]
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 GROUP_NAME_PATTERN = re.compile(r"^(?P<video>.+?)_f\d+_id(?P<track>[^_]+)_det\d+$")
 
 
@@ -37,154 +36,8 @@ class CropDataset(Dataset):
 
     def __getitem__(self, index: int):
         sample = self.samples[index]
-<<<<<<< HEAD
-        frames = load_clip_frames(sample.path, self.frames_per_clip)
-        clip_tensor = self.transform(frames)
-        return clip_tensor, sample.label
-
-
-class ClipTransform:
-    def __init__(
-        self,
-        image_size: int,
-        train: bool,
-        gaussian_noise_std: float = 0.03,
-    ) -> None:
-        self.image_size = image_size
-        self.train = train
-        self.gaussian_noise_std = gaussian_noise_std
-        self.normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        )
-        self.color_jitter = transforms.ColorJitter(
-            brightness=0.18,
-            contrast=0.18,
-            saturation=0.12,
-            hue=0.03,
-        )
-
-    def __call__(self, frames: Sequence[Image.Image]) -> torch.Tensor:
-        processed = list(frames)
-
-        if self.train:
-            processed = self._augment_clip(processed)
-        else:
-            processed = [
-                TF.resize(frame, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR)
-                for frame in processed
-            ]
-
-        tensor_frames = []
-        for frame in processed:
-            tensor = TF.to_tensor(frame)
-            if self.train and self.gaussian_noise_std > 0:
-                tensor = tensor + torch.randn_like(tensor) * self.gaussian_noise_std
-                tensor = tensor.clamp(0.0, 1.0)
-            tensor_frames.append(self.normalize(tensor))
-        return torch.stack(tensor_frames, dim=0)
-
-    def _augment_clip(self, frames: Sequence[Image.Image]) -> List[Image.Image]:
-        do_flip = random.random() < 0.5
-        rotation = random.uniform(-8.0, 8.0)
-        crop_scale = random.uniform(0.88, 1.0)
-        crop_size = max(1, int(self.image_size * crop_scale))
-        max_offset = self.image_size - crop_size
-        top = random.randint(0, max_offset) if max_offset > 0 else 0
-        left = random.randint(0, max_offset) if max_offset > 0 else 0
-        brightness_factor = random.uniform(0.82, 1.18)
-        contrast_factor = random.uniform(0.82, 1.18)
-        saturation_factor = random.uniform(0.88, 1.12)
-        hue_factor = random.uniform(-0.03, 0.03)
-
-        augmented: List[Image.Image] = []
-        for frame in frames:
-            img = TF.resize(frame, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR)
-            if do_flip:
-                img = TF.hflip(img)
-            img = TF.rotate(img, rotation, interpolation=InterpolationMode.BILINEAR, fill=0)
-            if crop_scale < 0.999:
-                img = TF.resized_crop(
-                    img,
-                    top=top,
-                    left=left,
-                    height=crop_size,
-                    width=crop_size,
-                    size=[self.image_size, self.image_size],
-                    interpolation=InterpolationMode.BILINEAR,
-                )
-            img = TF.adjust_brightness(img, brightness_factor)
-            img = TF.adjust_contrast(img, contrast_factor)
-            img = TF.adjust_saturation(img, saturation_factor)
-            img = TF.adjust_hue(img, hue_factor)
-            augmented.append(img)
-        return augmented
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.1, max_len: int = 512) -> None:
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
-        pe = torch.zeros(max_len, dim)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.pe[:, : x.size(1)]
-        return self.dropout(x)
-
-
-class TemporalTransformerClassifier(nn.Module):
-    def __init__(
-        self,
-        backbone_name: str,
-        num_classes: int,
-        transformer_dim: int,
-        num_heads: int,
-        num_layers: int,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-        self.frame_encoder, encoder_dim = build_frame_encoder(backbone_name)
-        self.projection = nn.Linear(encoder_dim, transformer_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, transformer_dim))
-        self.position = PositionalEncoding(transformer_dim, dropout=dropout, max_len=1024)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=transformer_dim,
-            nhead=num_heads,
-            dim_feedforward=transformer_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(transformer_dim)
-        self.head = nn.Linear(transformer_dim, num_classes)
-
-        nn.init.normal_(self.cls_token, std=0.02)
-
-    def forward(self, clips: torch.Tensor) -> torch.Tensor:
-        batch_size, time_steps, channels, height, width = clips.shape
-        frames = clips.view(batch_size * time_steps, channels, height, width)
-        frame_features = self.frame_encoder(frames)
-        frame_features = frame_features.view(batch_size, time_steps, -1)
-        tokens = self.projection(frame_features)
-
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        tokens = torch.cat([cls_tokens, tokens], dim=1)
-        tokens = self.position(tokens)
-        encoded = self.transformer(tokens)
-        cls_embedding = self.norm(encoded[:, 0])
-        return self.head(cls_embedding)
-=======
-        image = Image.open(sample.path).convert("RGB")
+        image = load_sample_image(sample.path)
         return self.transform(image), sample.label
->>>>>>> origin/feature/map
 
 
 def parse_args() -> argparse.Namespace:
@@ -203,21 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--device", default="auto")
-<<<<<<< HEAD
-    parser.add_argument("--transformer-dim", type=int, default=256)
-    parser.add_argument("--transformer-heads", type=int, default=8)
-    parser.add_argument("--transformer-layers", type=int, default=2)
-    parser.add_argument("--dropout", type=float, default=0.5)
-    parser.add_argument(
-        "--freeze-backbone-epochs",
-        type=int,
-        default=3,
-        help="Freeze the frame encoder for the first N epochs to stabilise training on a small dataset.",
-    )
-    parser.add_argument("--gaussian-noise-std", type=float, default=0.03)
+    parser.add_argument("--gaussian-noise-std", type=float, default=0.02)
     parser.add_argument("--early-stopping-patience", type=int, default=4)
-=======
->>>>>>> origin/feature/map
     return parser.parse_args()
 
 
@@ -235,6 +75,33 @@ def infer_group_key(image_path: Path) -> str:
     return f"{image_path.parent.name}|{image_path.stem}"
 
 
+def load_sample_image(sample_path: Path) -> Image.Image:
+    suffix = sample_path.suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return Image.open(sample_path).convert("RGB")
+    if suffix in VIDEO_EXTENSIONS:
+        import cv2
+
+        cap = cv2.VideoCapture(str(sample_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Unable to open sample video: {sample_path}")
+        try:
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            target_frame = max(0, frame_count // 2)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            ok, frame = cap.read()
+            if not ok:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = cap.read()
+            if not ok:
+                raise RuntimeError(f"Unable to decode a frame from sample video: {sample_path}")
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(frame_rgb)
+        finally:
+            cap.release()
+    raise ValueError(f"Unsupported sample extension: {sample_path.suffix}")
+
+
 def collect_labeled_samples(dataset_root: Path) -> List[ImageSample]:
     samples: List[ImageSample] = []
     for class_index, class_name in enumerate(CLASS_NAMES):
@@ -242,7 +109,7 @@ def collect_labeled_samples(dataset_root: Path) -> List[ImageSample]:
         if not class_dir.exists():
             continue
         for image_path in sorted(class_dir.rglob("*")):
-            if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            if image_path.suffix.lower() not in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS:
                 continue
             samples.append(
                 ImageSample(
@@ -310,14 +177,7 @@ def build_model(model_name: str) -> nn.Module:
     return model
 
 
-<<<<<<< HEAD
 def make_transforms(image_size: int, gaussian_noise_std: float):
-    train_transform = ClipTransform(
-        image_size=image_size,
-        train=True,
-        gaussian_noise_std=gaussian_noise_std,
-=======
-def make_transforms(image_size: int):
     train_transform = transforms.Compose(
         [
             transforms.Resize((image_size, image_size)),
@@ -325,6 +185,11 @@ def make_transforms(image_size: int):
             transforms.RandomRotation(degrees=6),
             transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
             transforms.ToTensor(),
+            transforms.Lambda(
+                lambda tensor: (tensor + torch.randn_like(tensor) * gaussian_noise_std).clamp(0.0, 1.0)
+                if gaussian_noise_std > 0
+                else tensor
+            ),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
@@ -334,9 +199,7 @@ def make_transforms(image_size: int):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
->>>>>>> origin/feature/map
     )
-    val_transform = ClipTransform(image_size=image_size, train=False, gaussian_noise_std=0.0)
     return train_transform, val_transform
 
 
@@ -516,16 +379,8 @@ def main() -> None:
         "best_val_f1": round(float(best_val_f1), 4),
         "best_epoch": best_epoch,
         "class_names": CLASS_NAMES,
-<<<<<<< HEAD
-        "transformer_dim": args.transformer_dim,
-        "transformer_heads": args.transformer_heads,
-        "transformer_layers": args.transformer_layers,
-        "dropout": args.dropout,
-        "freeze_backbone_epochs": args.freeze_backbone_epochs,
         "gaussian_noise_std": args.gaussian_noise_std,
         "early_stopping_patience": args.early_stopping_patience,
-=======
->>>>>>> origin/feature/map
         "history": history,
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
